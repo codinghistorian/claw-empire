@@ -151,6 +151,16 @@ export async function sendAnnouncement(content: string): Promise<string> {
   return j.id;
 }
 
+export async function clearMessages(agentId?: string): Promise<void> {
+  const params = new URLSearchParams();
+  if (agentId) {
+    params.set('agent_id', agentId);
+  } else {
+    params.set('scope', 'announcements');
+  }
+  await del(`/api/messages?${params.toString()}`);
+}
+
 // Terminal
 export async function getTerminal(id: string, lines?: number, pretty?: boolean): Promise<{
   ok: boolean;
@@ -187,4 +197,63 @@ export async function getSettings(): Promise<CompanySettings> {
 
 export async function saveSettings(settings: CompanySettings): Promise<void> {
   await put('/api/settings', settings);
+}
+
+// OAuth
+export interface OAuthProviderStatus {
+  connected: boolean;
+  source: string | null;
+  email: string | null;
+  scope: string | null;
+  expires_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface OAuthStatus {
+  storageReady: boolean;
+  providers: Record<string, OAuthProviderStatus>;
+}
+
+export async function getOAuthStatus(): Promise<OAuthStatus> {
+  return request<OAuthStatus>('/api/oauth/status');
+}
+
+// Git Worktree management
+export interface TaskDiffResult {
+  ok: boolean;
+  hasWorktree?: boolean;
+  branchName?: string;
+  stat?: string;
+  diff?: string;
+  error?: string;
+}
+
+export interface MergeResult {
+  ok: boolean;
+  message: string;
+  conflicts?: string[];
+}
+
+export interface WorktreeEntry {
+  taskId: string;
+  branchName: string;
+  worktreePath: string;
+  projectPath: string;
+}
+
+export async function getTaskDiff(id: string): Promise<TaskDiffResult> {
+  return request<TaskDiffResult>(`/api/tasks/${id}/diff`);
+}
+
+export async function mergeTask(id: string): Promise<MergeResult> {
+  return post(`/api/tasks/${id}/merge`) as Promise<MergeResult>;
+}
+
+export async function discardTask(id: string): Promise<{ ok: boolean; message: string }> {
+  return post(`/api/tasks/${id}/discard`) as Promise<{ ok: boolean; message: string }>;
+}
+
+export async function getWorktrees(): Promise<{ ok: boolean; worktrees: WorktreeEntry[] }> {
+  return request<{ ok: boolean; worktrees: WorktreeEntry[] }>('/api/worktrees');
 }

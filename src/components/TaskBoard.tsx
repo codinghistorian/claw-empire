@@ -1,5 +1,8 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import type { Task, Agent, Department, TaskStatus, TaskType } from '../types';
+import AgentAvatar from './AgentAvatar';
+import AgentSelect from './AgentSelect';
+import { getTaskDiff, mergeTask, discardTask, type TaskDiffResult } from '../api';
 
 interface TaskBoardProps {
   tasks: Task[];
@@ -20,6 +23,8 @@ interface TaskBoardProps {
   onPauseTask?: (id: string) => void;
   onResumeTask?: (id: string) => void;
   onOpenTerminal?: (taskId: string) => void;
+  onMergeTask?: (id: string) => void;
+  onDiscardTask?: (id: string) => void;
 }
 
 // ── Column config ──────────────────────────────────────────────────────────────
@@ -297,18 +302,13 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
           {/* Assign Agent */}
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-300">담당 에이전트</label>
-            <select
+            <AgentSelect
+              agents={filteredAgents}
               value={assignAgentId}
-              onChange={(e) => setAssignAgentId(e.target.value)}
-              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="">-- 미배정 --</option>
-              {filteredAgents.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.avatar_emoji} {a.name_ko} ({a.role})
-                </option>
-              ))}
-            </select>
+              onChange={setAssignAgentId}
+              placeholder="-- 미배정 --"
+              size="md"
+            />
             {departmentId && filteredAgents.length === 0 && (
               <p className="mt-1 text-xs text-slate-500">해당 부서에 에이전트가 없습니다.</p>
             )}
@@ -339,6 +339,156 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
 
 // ── Task Card ─────────────────────────────────────────────────────────────────
 
+// ── Diff Modal ────────────────────────────────────────────────────────────────
+
+function DiffModal({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+  const [diffData, setDiffData] = useState<TaskDiffResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
+  const [actionResult, setActionResult] = useState<string | null>(null);
+
+  useEffect(() => {
+    getTaskDiff(taskId)
+      .then((d) => {
+        if (!d.ok) setError(d.error || 'Unknown error');
+        else setDiffData(d);
+        setLoading(false);
+      })
+      .catch((e) => { setError(e instanceof Error ? e.message : String(e)); setLoading(false); });
+  }, [taskId]);
+
+  // Close on Escape key
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  const handleMerge = useCallback(async () => {
+    if (!confirm('이 브랜치를 메인에 병합하시겠습니까?')) return;
+    setMerging(true);
+    try {
+      const result = await mergeTask(taskId);
+      setActionResult(result.ok ? `병합 완료: ${result.message}` : `병합 실패: ${result.message}`);
+      if (result.ok) setTimeout(onClose, 1500);
+    } catch (e: unknown) {
+      setActionResult(`오류: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setMerging(false);
+    }
+  }, [taskId, onClose]);
+
+  const handleDiscard = useCallback(async () => {
+    if (!confirm('이 브랜치의 변경사항을 모두 폐기하시겠습니까? 이 작업은 되돌릴 수 없습니다.')) return;
+    setDiscarding(true);
+    try {
+      const result = await discardTask(taskId);
+      setActionResult(result.ok ? '브랜치가 폐기되었습니다.' : `폐기 실패: ${result.message}`);
+      if (result.ok) setTimeout(onClose, 1500);
+    } catch (e: unknown) {
+      setActionResult(`오류: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDiscarding(false);
+    }
+  }, [taskId, onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="flex max-h-[85vh] w-full max-w-4xl flex-col rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-slate-700 px-5 py-3">
+          <div className="flex items-center gap-2">
+            <span className="text-lg font-bold text-white">Git Diff</span>
+            {diffData?.branchName && (
+              <span className="rounded-full bg-purple-900 px-2.5 py-0.5 text-xs text-purple-300">
+                {diffData.branchName}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleMerge}
+              disabled={merging || discarding || !diffData?.hasWorktree}
+              className="rounded-lg bg-green-700 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-green-600 disabled:opacity-40"
+            >
+              {merging ? '...' : 'Merge'}
+            </button>
+            <button
+              onClick={handleDiscard}
+              disabled={merging || discarding || !diffData?.hasWorktree}
+              className="rounded-lg bg-red-800 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-red-700 disabled:opacity-40"
+            >
+              {discarding ? '...' : 'Discard'}
+            </button>
+            <button
+              onClick={onClose}
+              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+            >
+              X
+            </button>
+          </div>
+        </div>
+
+        {/* Action result */}
+        {actionResult && (
+          <div className="border-b border-slate-700 bg-slate-800 px-5 py-2 text-sm text-amber-300">
+            {actionResult}
+          </div>
+        )}
+
+        {/* Content */}
+        <div className="flex-1 overflow-auto p-5">
+          {loading ? (
+            <div className="flex items-center justify-center py-12 text-slate-400">Loading diff...</div>
+          ) : error ? (
+            <div className="flex items-center justify-center py-12 text-red-400">
+              Error: {error}
+            </div>
+          ) : !diffData?.hasWorktree ? (
+            <div className="flex items-center justify-center py-12 text-slate-500">
+              No worktree found for this task (non-git project or already merged)
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {/* Stat summary */}
+              {diffData.stat && (
+                <div>
+                  <h3 className="mb-1 text-sm font-semibold text-slate-300">Summary</h3>
+                  <pre className="rounded-lg bg-slate-800 p-3 text-xs text-slate-300 overflow-x-auto">{diffData.stat}</pre>
+                </div>
+              )}
+              {/* Full diff */}
+              {diffData.diff && (
+                <div>
+                  <h3 className="mb-1 text-sm font-semibold text-slate-300">Diff</h3>
+                  <pre className="max-h-[50vh] overflow-auto rounded-lg bg-slate-950 p-3 text-xs leading-relaxed">
+                    {diffData.diff.split('\n').map((line, i) => {
+                      let cls = 'text-slate-400';
+                      if (line.startsWith('+') && !line.startsWith('+++')) cls = 'text-green-400';
+                      else if (line.startsWith('-') && !line.startsWith('---')) cls = 'text-red-400';
+                      else if (line.startsWith('@@')) cls = 'text-cyan-400';
+                      else if (line.startsWith('diff ') || line.startsWith('index ')) cls = 'text-slate-500 font-bold';
+                      return <span key={i} className={cls}>{line}{'\n'}</span>;
+                    })}
+                  </pre>
+                </div>
+              )}
+              {!diffData.stat && !diffData.diff && (
+                <div className="text-center text-slate-500 py-8">No changes detected</div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface TaskCardProps {
   task: Task;
   agents: Agent[];
@@ -351,6 +501,8 @@ interface TaskCardProps {
   onPauseTask?: (id: string) => void;
   onResumeTask?: (id: string) => void;
   onOpenTerminal?: (taskId: string) => void;
+  onMergeTask?: (id: string) => void;
+  onDiscardTask?: (id: string) => void;
 }
 
 function TaskCard({
@@ -367,6 +519,7 @@ function TaskCard({
   onOpenTerminal,
 }: TaskCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const [showDiff, setShowDiff] = useState(false);
 
   const assignedAgent = task.assigned_agent ?? agents.find((a) => a.id === task.assigned_agent_id);
   const department = departments.find((d) => d.id === task.department_id);
@@ -434,7 +587,7 @@ function TaskCard({
         <div className="flex items-center gap-1.5">
           {assignedAgent ? (
             <>
-              <span className="text-base">{assignedAgent.avatar_emoji}</span>
+              <AgentAvatar agent={assignedAgent} agents={agents} size={20} />
               <span className="text-xs text-slate-300">{assignedAgent.name_ko}</span>
             </>
           ) : (
@@ -446,24 +599,17 @@ function TaskCard({
 
       {/* Assign agent dropdown */}
       <div className="mb-3">
-        <select
+        <AgentSelect
+          agents={agents}
           value={task.assigned_agent_id ?? ''}
-          onChange={(e) => {
-            if (e.target.value) {
-              onAssignTask(task.id, e.target.value);
+          onChange={(agentId) => {
+            if (agentId) {
+              onAssignTask(task.id, agentId);
             } else {
               onUpdateTask(task.id, { assigned_agent_id: null });
             }
           }}
-          className="w-full rounded-lg border border-slate-600 bg-slate-700 px-2 py-1 text-xs text-slate-300 outline-none transition focus:border-blue-500"
-        >
-          <option value="">-- 담당자 없음 --</option>
-          {agents.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.avatar_emoji} {a.name_ko}
-            </option>
-          ))}
-        </select>
+        />
       </div>
 
       {/* Action buttons */}
@@ -513,6 +659,15 @@ function TaskCard({
             &#128421;
           </button>
         )}
+        {task.status === 'review' && (
+          <button
+            onClick={() => setShowDiff(true)}
+            title="View changes (Git diff)"
+            className="flex items-center justify-center gap-1 rounded-lg bg-purple-800 px-2 py-1.5 text-xs font-medium text-purple-200 transition hover:bg-purple-700"
+          >
+            Diff
+          </button>
+        )}
         {canDelete && (
           <button
             onClick={() => {
@@ -525,6 +680,9 @@ function TaskCard({
           </button>
         )}
       </div>
+
+      {/* Diff modal */}
+      {showDiff && <DiffModal taskId={task.id} onClose={() => setShowDiff(false)} />}
     </div>
   );
 }
@@ -585,18 +743,13 @@ function FilterBar({
       </select>
 
       {/* Agent */}
-      <select
+      <AgentSelect
+        agents={agents}
         value={filterAgent}
-        onChange={(e) => onFilterAgent(e.target.value)}
-        className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm text-slate-300 outline-none transition focus:border-blue-500"
-      >
-        <option value="">전체 에이전트</option>
-        {agents.map((a) => (
-          <option key={a.id} value={a.id}>
-            {a.avatar_emoji} {a.name_ko}
-          </option>
-        ))}
-      </select>
+        onChange={onFilterAgent}
+        placeholder="전체 에이전트"
+        size="md"
+      />
 
       {/* Task type */}
       <select
@@ -630,6 +783,8 @@ export function TaskBoard({
   onPauseTask,
   onResumeTask,
   onOpenTerminal,
+  onMergeTask,
+  onDiscardTask,
 }: TaskBoardProps) {
   const [showCreate, setShowCreate] = useState(false);
   const [filterDept, setFilterDept] = useState('');
@@ -752,6 +907,8 @@ export function TaskBoard({
                       onPauseTask={onPauseTask}
                       onResumeTask={onResumeTask}
                       onOpenTerminal={onOpenTerminal}
+                      onMergeTask={onMergeTask}
+                      onDiscardTask={onDiscardTask}
                     />
                   ))
                 )}

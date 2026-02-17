@@ -4,7 +4,7 @@ import path from "path";
 import fs from "node:fs";
 import os from "node:os";
 import { randomUUID, createHash, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { WebSocketServer, WebSocket } from "ws";
 import { fileURLToPath } from "node:url";
@@ -245,23 +245,35 @@ if (agentCount === 0) {
   // Development (3)
   insertAgent.run(randomUUID(), "Aria",  "아리아", "dev",        "team_leader", "claude",   "👩‍💻", "꼼꼼한 시니어 개발자");
   insertAgent.run(randomUUID(), "Bolt",  "볼트",   "dev",        "senior",      "codex",    "⚡",   "빠른 코딩 전문가");
-  insertAgent.run(randomUUID(), "Nova",  "노바",   "dev",        "junior",      "gemini",   "🌟",   "창의적인 주니어");
+  insertAgent.run(randomUUID(), "Nova",  "노바",   "dev",        "junior",      "copilot",  "🌟",   "창의적인 주니어");
   // Design (2)
   insertAgent.run(randomUUID(), "Pixel", "픽셀",   "design",     "team_leader", "claude",   "🎨",   "디자인 리더");
   insertAgent.run(randomUUID(), "Luna",  "루나",   "design",     "junior",      "gemini",   "🌙",   "감성적인 UI 디자이너");
   // Planning (2)
-  insertAgent.run(randomUUID(), "Sage",  "세이지", "planning",   "team_leader", "opencode", "🧠",   "전략 분석가");
+  insertAgent.run(randomUUID(), "Sage",  "세이지", "planning",   "team_leader", "codex",    "🧠",   "전략 분석가");
   insertAgent.run(randomUUID(), "Clio",  "클리오", "planning",   "senior",      "claude",   "📝",   "데이터 기반 기획자");
   // Operations (2)
   insertAgent.run(randomUUID(), "Atlas", "아틀라스","operations", "team_leader", "claude",   "🗺️",  "운영의 달인");
   insertAgent.run(randomUUID(), "Turbo", "터보",   "operations", "senior",      "codex",    "🚀",   "자동화 전문가");
   // QA/QC (2)
   insertAgent.run(randomUUID(), "Hawk",  "호크",   "qa",         "team_leader", "claude",   "🦅",   "날카로운 품질 감시자");
-  insertAgent.run(randomUUID(), "Lint",  "린트",   "qa",         "senior",      "opencode", "🔬",   "꼼꼼한 테스트 전문가");
+  insertAgent.run(randomUUID(), "Lint",  "린트",   "qa",         "senior",      "codex",    "🔬",   "꼼꼼한 테스트 전문가");
   // DevSecOps (2)
   insertAgent.run(randomUUID(), "Vault", "볼트S",  "devsecops",  "team_leader", "claude",   "🛡️",  "보안 아키텍트");
   insertAgent.run(randomUUID(), "Pipe",  "파이프", "devsecops",  "senior",      "codex",    "🔧",   "CI/CD 파이프라인 전문가");
   console.log("[CLImpire] Seeded default agents");
+}
+
+// Seed default settings if none exist
+{
+  const settingsCount = (db.prepare("SELECT COUNT(*) as c FROM settings").get() as { c: number }).c;
+  if (settingsCount === 0) {
+    const insertSetting = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
+    insertSetting.run("companyName", "CLImpire Corp.");
+    insertSetting.run("ceoName", "CEO");
+    insertSetting.run("autoAssign", "true");
+    console.log("[CLImpire] Seeded default settings");
+  }
 }
 
 // Migrate: add sort_order column & set correct ordering for existing DBs
@@ -317,6 +329,165 @@ if (agentCount === 0) {
 const activeProcesses = new Map<string, ChildProcess>();
 
 // ---------------------------------------------------------------------------
+// Git Worktree support — agent isolation per task
+// ---------------------------------------------------------------------------
+const taskWorktrees = new Map<string, {
+  worktreePath: string;
+  branchName: string;
+  projectPath: string; // original project path
+}>();
+
+function isGitRepo(dir: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: dir, stdio: "pipe", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createWorktree(projectPath: string, taskId: string, agentName: string): string | null {
+  if (!isGitRepo(projectPath)) return null;
+
+  const shortId = taskId.slice(0, 8);
+  const branchName = `climpire/${shortId}`;
+  const worktreeBase = path.join(projectPath, ".climpire-worktrees");
+  const worktreePath = path.join(worktreeBase, shortId);
+
+  try {
+    fs.mkdirSync(worktreeBase, { recursive: true });
+
+    // Get current branch/HEAD as base
+    const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectPath, stdio: "pipe", timeout: 5000 }).toString().trim();
+
+    // Create worktree with new branch
+    execFileSync("git", ["worktree", "add", worktreePath, "-b", branchName, base], {
+      cwd: projectPath,
+      stdio: "pipe",
+      timeout: 15000,
+    });
+
+    taskWorktrees.set(taskId, { worktreePath, branchName, projectPath });
+    console.log(`[CLImpire] Created worktree for task ${shortId}: ${worktreePath} (branch: ${branchName}, agent: ${agentName})`);
+    return worktreePath;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[CLImpire] Failed to create worktree for task ${shortId}: ${msg}`);
+    return null;
+  }
+}
+
+function mergeWorktree(projectPath: string, taskId: string): { success: boolean; message: string; conflicts?: string[] } {
+  const info = taskWorktrees.get(taskId);
+  if (!info) return { success: false, message: "No worktree found for this task" };
+
+  try {
+    // Get current branch name in the original repo
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: projectPath, stdio: "pipe", timeout: 5000,
+    }).toString().trim();
+
+    // Check if there are actual changes to merge
+    try {
+      const diffCheck = execFileSync("git", ["diff", `${currentBranch}...${info.branchName}`, "--stat"], {
+        cwd: projectPath, stdio: "pipe", timeout: 10000,
+      }).toString().trim();
+      if (!diffCheck) {
+        return { success: true, message: "변경사항 없음 — 병합 불필요" };
+      }
+    } catch { /* proceed with merge attempt anyway */ }
+
+    // Attempt merge with no-ff
+    const mergeMsg = `Merge climpire task ${taskId.slice(0, 8)} (branch ${info.branchName})`;
+    execFileSync("git", ["merge", info.branchName, "--no-ff", "-m", mergeMsg], {
+      cwd: projectPath, stdio: "pipe", timeout: 30000,
+    });
+
+    return { success: true, message: `병합 완료: ${info.branchName} → ${currentBranch}` };
+  } catch (err: unknown) {
+    // Detect conflicts by checking git status instead of parsing error messages
+    try {
+      const unmerged = execFileSync("git", ["diff", "--name-only", "--diff-filter=U"], {
+        cwd: projectPath, stdio: "pipe", timeout: 5000,
+      }).toString().trim();
+      const conflicts = unmerged ? unmerged.split("\n").filter(Boolean) : [];
+
+      if (conflicts.length > 0) {
+        // Abort the failed merge
+        try { execFileSync("git", ["merge", "--abort"], { cwd: projectPath, stdio: "pipe", timeout: 5000 }); } catch { /* ignore */ }
+
+        return {
+          success: false,
+          message: `병합 충돌 발생: ${conflicts.length}개 파일에서 충돌이 있습니다. 수동 해결이 필요합니다.`,
+          conflicts,
+        };
+      }
+    } catch { /* ignore conflict detection failure */ }
+
+    // Abort any partial merge
+    try { execFileSync("git", ["merge", "--abort"], { cwd: projectPath, stdio: "pipe", timeout: 5000 }); } catch { /* ignore */ }
+
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, message: `병합 실패: ${msg}` };
+  }
+}
+
+function cleanupWorktree(projectPath: string, taskId: string): void {
+  const info = taskWorktrees.get(taskId);
+  if (!info) return;
+
+  const shortId = taskId.slice(0, 8);
+
+  try {
+    // Remove worktree
+    execFileSync("git", ["worktree", "remove", info.worktreePath, "--force"], {
+      cwd: projectPath, stdio: "pipe", timeout: 10000,
+    });
+  } catch {
+    // If worktree remove fails, try manual cleanup
+    console.warn(`[CLImpire] git worktree remove failed for ${shortId}, falling back to manual cleanup`);
+    try {
+      if (fs.existsSync(info.worktreePath)) {
+        fs.rmSync(info.worktreePath, { recursive: true, force: true });
+      }
+      execFileSync("git", ["worktree", "prune"], { cwd: projectPath, stdio: "pipe", timeout: 5000 });
+    } catch { /* ignore */ }
+  }
+
+  try {
+    // Delete branch
+    execFileSync("git", ["branch", "-D", info.branchName], {
+      cwd: projectPath, stdio: "pipe", timeout: 5000,
+    });
+  } catch {
+    console.warn(`[CLImpire] Failed to delete branch ${info.branchName} — may need manual cleanup`);
+  }
+
+  taskWorktrees.delete(taskId);
+  console.log(`[CLImpire] Cleaned up worktree for task ${shortId}`);
+}
+
+function getWorktreeDiffSummary(projectPath: string, taskId: string): string {
+  const info = taskWorktrees.get(taskId);
+  if (!info) return "";
+
+  try {
+    // Get current branch in original repo
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: projectPath, stdio: "pipe", timeout: 5000,
+    }).toString().trim();
+
+    const stat = execFileSync("git", ["diff", `${currentBranch}...${info.branchName}`, "--stat"], {
+      cwd: projectPath, stdio: "pipe", timeout: 10000,
+    }).toString().trim();
+
+    return stat || "변경사항 없음";
+  } catch {
+    return "diff 조회 실패";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket setup
 // ---------------------------------------------------------------------------
 const wsClients = new Set<WebSocket>();
@@ -358,6 +529,37 @@ function buildAgentArgs(provider: string): string[] {
   }
 }
 
+/** Fetch recent conversation context for an agent to include in spawn prompt */
+function getRecentConversationContext(agentId: string, limit = 10): string {
+  const msgs = db.prepare(`
+    SELECT sender_type, sender_id, content, message_type, created_at
+    FROM messages
+    WHERE (
+      (sender_type = 'ceo' AND receiver_type = 'agent' AND receiver_id = ?)
+      OR (sender_type = 'agent' AND sender_id = ?)
+      OR (receiver_type = 'all')
+    )
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(agentId, agentId, limit) as Array<{
+    sender_type: string;
+    sender_id: string | null;
+    content: string;
+    message_type: string;
+    created_at: number;
+  }>;
+
+  if (msgs.length === 0) return "";
+
+  const lines = msgs.reverse().map((m) => {
+    const role = m.sender_type === "ceo" ? "CEO" : "Agent";
+    const type = m.message_type !== "chat" ? ` [${m.message_type}]` : "";
+    return `${role}${type}: ${m.content}`;
+  });
+
+  return `\n\n--- Recent conversation context ---\n${lines.join("\n")}\n--- End context ---`;
+}
+
 function spawnCliAgent(
   taskId: string,
   provider: string,
@@ -372,8 +574,14 @@ function spawnCliAgent(
   const args = buildAgentArgs(provider);
   const logStream = fs.createWriteStream(logPath, { flags: "w" });
 
+  // Remove CLAUDECODE env var to prevent "nested session" detection
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.CLAUDECODE;
+  delete cleanEnv.CLAUDE_CODE;
+
   const child = spawn(args[0], args.slice(1), {
     cwd: projectPath,
+    env: cleanEnv,
     shell: process.platform === "win32",
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
@@ -565,8 +773,13 @@ async function detectAllCli(): Promise<CliStatusResult> {
 // Track progress report timers so we can cancel them when tasks finish
 const progressTimers = new Map<string, ReturnType<typeof setInterval>>();
 
+// Cross-department sequential queue: when a cross-dept task finishes,
+// trigger the next department in line (instead of spawning all simultaneously).
+// Key: cross-dept task ID → callback to start next department
+const crossDeptNextCallbacks = new Map<string, () => void>();
+
 function startProgressTimer(taskId: string, taskTitle: string, departmentId: string | null): void {
-  // Send progress report every 60s for long-running tasks
+  // Send progress report every 5min for long-running tasks
   const timer = setInterval(() => {
     const currentTask = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
     if (!currentTask || currentTask.status !== "in_progress") {
@@ -585,7 +798,7 @@ function startProgressTimer(taskId: string, taskTitle: string, departmentId: str
         taskId,
       );
     }
-  }, 60_000);
+  }, 300_000);
   progressTimers.set(taskId, timer);
 }
 
@@ -706,10 +919,24 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
         }
       } catch { /* ignore */ }
 
-      // Team leader sends completion report with actual result content
-      const reportContent = reportBody
+      // If worktree exists, include diff summary in the report
+      const wtInfo = taskWorktrees.get(taskId);
+      let diffSummary = "";
+      if (wtInfo) {
+        diffSummary = getWorktreeDiffSummary(wtInfo.projectPath, taskId);
+        if (diffSummary && diffSummary !== "변경사항 없음") {
+          appendTaskLog(taskId, "system", `Worktree diff summary:\n${diffSummary}`);
+        }
+      }
+
+      // Team leader sends completion report with actual result content + diff
+      let reportContent = reportBody
         ? `대표님, '${task.title}' 업무 완료 보고드립니다.\n\n📋 결과:\n${reportBody}`
         : `대표님, '${task.title}' 업무 완료 보고드립니다. 작업이 성공적으로 마무리되었습니다.`;
+
+      if (diffSummary && diffSummary !== "변경사항 없음" && diffSummary !== "diff 조회 실패") {
+        reportContent += `\n\n📝 변경사항 (branch: ${wtInfo?.branchName}):\n${diffSummary}`;
+      }
 
       sendAgentMessage(
         leader,
@@ -734,6 +961,13 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
 
     const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
     broadcast("task_update", updatedTask);
+
+    // Clean up worktree on failure — failed work shouldn't persist
+    const failWtInfo = taskWorktrees.get(taskId);
+    if (failWtInfo) {
+      cleanupWorktree(failWtInfo.projectPath, taskId);
+      appendTaskLog(taskId, "system", "Worktree cleaned up (task failed)");
+    }
 
     if (task) {
       const leader = findTeamLeader(task.department_id);
@@ -766,6 +1000,13 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
       }
       notifyCeo(`'${task.title}' 작업 실패 (exit code: ${exitCode}).`, taskId);
     }
+
+    // Even on failure, trigger next cross-dept cooperation so the queue doesn't stall
+    const nextCallback = crossDeptNextCallbacks.get(taskId);
+    if (nextCallback) {
+      crossDeptNextCallbacks.delete(taskId);
+      setTimeout(nextCallback, 3000);
+    }
   }
 }
 
@@ -774,6 +1015,38 @@ function finishReview(taskId: string, taskTitle: string): void {
   const t = nowMs();
   const currentTask = db.prepare("SELECT status, department_id FROM tasks WHERE id = ?").get(taskId) as { status: string; department_id: string | null } | undefined;
   if (!currentTask || currentTask.status !== "review") return; // Already moved or cancelled
+
+  // If task has a worktree, merge the branch back before marking done
+  const wtInfo = taskWorktrees.get(taskId);
+  let mergeNote = "";
+  if (wtInfo) {
+    const mergeResult = mergeWorktree(wtInfo.projectPath, taskId);
+
+    if (mergeResult.success) {
+      appendTaskLog(taskId, "system", `Git merge 완료: ${mergeResult.message}`);
+      cleanupWorktree(wtInfo.projectPath, taskId);
+      appendTaskLog(taskId, "system", "Worktree cleaned up after successful merge");
+      mergeNote = " (병합 완료)";
+    } else {
+      // Merge conflict or failure — report to CEO, keep worktree for manual resolution
+      appendTaskLog(taskId, "system", `Git merge 실패: ${mergeResult.message}`);
+
+      const conflictLeader = findTeamLeader(currentTask.department_id);
+      const conflictLeaderName = conflictLeader?.name_ko || conflictLeader?.name || "팀장";
+      const conflictFiles = mergeResult.conflicts?.length
+        ? `\n충돌 파일: ${mergeResult.conflicts.join(", ")}`
+        : "";
+      notifyCeo(
+        `${conflictLeaderName}: '${taskTitle}' 병합 중 충돌이 발생했습니다. 수동 해결이 필요합니다.${conflictFiles}\n` +
+        `브랜치: ${wtInfo.branchName}`,
+        taskId,
+      );
+
+      mergeNote = " (병합 충돌 - 수동 해결 필요)";
+      // Don't clean up worktree — keep it for manual conflict resolution
+      // Still move task to done since the work itself is approved
+    }
+  }
 
   db.prepare(
     "UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?"
@@ -786,7 +1059,14 @@ function finishReview(taskId: string, taskTitle: string): void {
 
   const leader = findTeamLeader(currentTask.department_id);
   const leaderName = leader?.name_ko || leader?.name || "팀장";
-  notifyCeo(`${leaderName}: '${taskTitle}' 완료 보고드립니다.`, taskId);
+  notifyCeo(`${leaderName}: '${taskTitle}' 완료 보고드립니다.${mergeNote}`, taskId);
+
+  // Trigger next cross-dept cooperation if queued (sequential chain)
+  const nextCallback = crossDeptNextCallbacks.get(taskId);
+  if (nextCallback) {
+    crossDeptNextCallbacks.delete(taskId);
+    nextCallback();
+  }
 }
 
 // ===========================================================================
@@ -1238,6 +1518,7 @@ app.post("/api/tasks/:id/run", (req, res) => {
     role: string;
     cli_provider: string | null;
     personality: string | null;
+    department_id: string | null;
     department_name: string | null;
     department_name_ko: string | null;
   } | undefined;
@@ -1256,23 +1537,36 @@ app.post("/api/tasks/:id/run", (req, res) => {
     return res.status(400).json({ error: "unsupported_provider", provider });
   }
 
-  const projectPath = task.project_path || (req.body?.project_path as string | undefined) || process.cwd();
+  const projectPath = resolveProjectPath(task) || (req.body?.project_path as string | undefined) || process.cwd();
   const logPath = path.join(logsDir, `${id}.log`);
 
-  // Build rich prompt with agent context
+  // Try to create a Git worktree for agent isolation
+  const worktreePath = createWorktree(projectPath, id, agent.name);
+  const agentCwd = worktreePath || projectPath;
+
+  if (worktreePath) {
+    appendTaskLog(id, "system", `Git worktree created: ${worktreePath} (branch: climpire/${id.slice(0, 8)})`);
+  }
+
+  // Build rich prompt with agent context + conversation history + role constraint
   const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[agent.role] || agent.role;
+  const deptConstraint = agent.department_id ? getDeptRoleConstraint(agent.department_id, agent.department_name || agent.department_id) : "";
+  const conversationCtx = getRecentConversationContext(agentId);
   const prompt = [
     `[Task] ${task.title}`,
     task.description ? `\n${task.description}` : "",
+    conversationCtx,
     `\n---`,
     `Agent: ${agent.name} (${roleLabel}, ${agent.department_name || "Unassigned"})`,
     agent.personality ? `Personality: ${agent.personality}` : "",
-    `Please complete the task above thoroughly.`,
+    deptConstraint,
+    worktreePath ? `NOTE: You are working in an isolated Git worktree branch (climpire/${id.slice(0, 8)}). Commit your changes normally.` : "",
+    `Please complete the task above thoroughly. Use the conversation context above if relevant.`,
   ].filter(Boolean).join("\n");
 
   appendTaskLog(id, "system", `RUN start (agent=${agent.name}, provider=${provider})`);
 
-  const child = spawnCliAgent(id, provider, prompt, projectPath, logPath);
+  const child = spawnCliAgent(id, provider, prompt, agentCwd, logPath);
 
   child.on("close", (code) => {
     handleTaskRunComplete(id, code ?? 1);
@@ -1294,13 +1588,14 @@ app.post("/api/tasks/:id/run", (req, res) => {
   broadcast("agent_status", updatedAgent);
 
   // B4: Notify CEO that task started
-  notifyCeo(`${agent.name_ko || agent.name}가 '${task.title}' 작업을 시작했습니다.`, id);
+  const worktreeNote = worktreePath ? ` (격리 브랜치: climpire/${id.slice(0, 8)})` : "";
+  notifyCeo(`${agent.name_ko || agent.name}가 '${task.title}' 작업을 시작했습니다.${worktreeNote}`, id);
 
   // B2: Start progress report timer for long-running tasks
   const taskRow = db.prepare("SELECT department_id FROM tasks WHERE id = ?").get(id) as { department_id: string | null } | undefined;
   startProgressTimer(id, task.title, taskRow?.department_id ?? null);
 
-  res.json({ ok: true, pid: child.pid ?? null, logPath, cwd: projectPath });
+  res.json({ ok: true, pid: child.pid ?? null, logPath, cwd: agentCwd, worktree: !!worktreePath });
 });
 
 app.post("/api/tasks/:id/stop", (req, res) => {
@@ -1896,6 +2191,77 @@ function detectTargetDepartments(message: string): string[] {
   return found;
 }
 
+/** Detect @mentions in messages — returns department IDs and agent IDs */
+function detectMentions(message: string): { deptIds: string[]; agentIds: string[] } {
+  const deptIds: string[] = [];
+  const agentIds: string[] = [];
+
+  // Match @부서이름 patterns (both with and without 팀 suffix)
+  const depts = db.prepare("SELECT id, name, name_ko FROM departments").all() as { id: string; name: string; name_ko: string }[];
+  for (const dept of depts) {
+    const nameKo = dept.name_ko.replace("팀", "");
+    if (
+      message.includes(`@${dept.name_ko}`) ||
+      message.includes(`@${nameKo}`) ||
+      message.includes(`@${dept.name}`) ||
+      message.includes(`@${dept.id}`)
+    ) {
+      deptIds.push(dept.id);
+    }
+  }
+
+  // Match @에이전트이름 patterns
+  const agents = db.prepare("SELECT id, name, name_ko FROM agents").all() as { id: string; name: string; name_ko: string | null }[];
+  for (const agent of agents) {
+    if (
+      (agent.name_ko && message.includes(`@${agent.name_ko}`)) ||
+      message.includes(`@${agent.name}`)
+    ) {
+      agentIds.push(agent.id);
+    }
+  }
+
+  return { deptIds, agentIds };
+}
+
+/** Handle mention-based delegation: create task in mentioned department */
+function handleMentionDelegation(
+  originLeader: AgentRow,
+  targetDeptId: string,
+  ceoMessage: string,
+  lang: string,
+): void {
+  const crossLeader = findTeamLeader(targetDeptId);
+  if (!crossLeader) return;
+  const crossDeptName = getDeptName(targetDeptId);
+  const crossLeaderName = lang === "ko" ? (crossLeader.name_ko || crossLeader.name) : crossLeader.name;
+  const originLeaderName = lang === "ko" ? (originLeader.name_ko || originLeader.name) : originLeader.name;
+  const taskTitle = ceoMessage.length > 60 ? ceoMessage.slice(0, 57) + "..." : ceoMessage;
+
+  // Origin team leader sends mention request to target team leader
+  const mentionReq = pickL(l(
+    [`${crossLeaderName}님! 대표님 지시입니다: "${taskTitle}" — ${crossDeptName}에서 처리 부탁드립니다! 🏷️`, `${crossLeaderName}님, 대표님이 직접 요청하셨습니다. "${taskTitle}" 건, ${crossDeptName} 담당으로 진행해주세요!`],
+    [`${crossLeaderName}! CEO directive for ${crossDeptName}: "${taskTitle}" — please handle this! 🏷️`, `${crossLeaderName}, CEO requested this for your team: "${taskTitle}"`],
+    [`${crossLeaderName}さん！CEO指示です："${taskTitle}" — ${crossDeptName}で対応お願いします！🏷️`],
+    [`${crossLeaderName}，CEO指示："${taskTitle}" — 请${crossDeptName}处理！🏷️`],
+  ), lang);
+  sendAgentMessage(originLeader, mentionReq, "task_assign", "agent", crossLeader.id, null);
+
+  // Broadcast delivery animation event for UI
+  broadcast("cross_dept_delivery", {
+    from_agent_id: originLeader.id,
+    to_agent_id: crossLeader.id,
+    task_title: taskTitle,
+  });
+
+  // Target team leader acknowledges and delegates
+  const ackDelay = 1500 + Math.random() * 1000;
+  setTimeout(() => {
+    // Use the full delegation flow for the target department
+    handleTaskDelegation(crossLeader, ceoMessage, "");
+  }, ackDelay);
+}
+
 function findBestSubordinate(deptId: string, excludeId: string): AgentRow | null {
   // Find subordinates in department, prefer: idle > break, higher role first
   const agents = db.prepare(
@@ -1918,6 +2284,241 @@ function getDeptName(deptId: string): string {
   return d?.name_ko ?? deptId;
 }
 
+// Role enforcement: restrict agents to their department's domain
+function getDeptRoleConstraint(deptId: string, deptName: string): string {
+  const constraints: Record<string, string> = {
+    planning: `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName} (Planning). Focus ONLY on planning, strategy, market analysis, requirements, and documentation. Do NOT write production code, create design assets, or run tests. If coding/design is needed, describe requirements and specifications instead.`,
+    dev: `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName} (Development). Focus ONLY on coding, debugging, code review, and technical implementation. Do NOT create design mockups, write business strategy documents, or perform QA testing.`,
+    design: `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName} (Design). Focus ONLY on UI/UX design, visual assets, design specs, and prototyping. Do NOT write production backend code, run tests, or make infrastructure changes.`,
+    qa: `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName} (QA/QC). Focus ONLY on testing, quality assurance, test automation, and bug reporting. Do NOT write production code or create design assets.`,
+    devsecops: `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName} (DevSecOps). Focus ONLY on infrastructure, security audits, CI/CD pipelines, container orchestration, and deployment. Do NOT write business logic or create design assets.`,
+    operations: `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName} (Operations). Focus ONLY on operations, automation, monitoring, maintenance, and process optimization. Do NOT write production code or create design assets.`,
+  };
+  return constraints[deptId] || `IMPORTANT ROLE CONSTRAINT: You belong to ${deptName}. Focus on tasks within your department's expertise.`;
+}
+
+// ---------------------------------------------------------------------------
+// Sequential cross-department cooperation: one department at a time
+// ---------------------------------------------------------------------------
+interface CrossDeptContext {
+  teamLeader: AgentRow;
+  taskTitle: string;
+  ceoMessage: string;
+  leaderDeptId: string;
+  leaderDeptName: string;
+  leaderName: string;
+  lang: string;
+  taskId: string;
+}
+
+function startCrossDeptCooperation(
+  deptIds: string[],
+  index: number,
+  ctx: CrossDeptContext,
+): void {
+  if (index >= deptIds.length) return; // All departments processed
+
+  const crossDeptId = deptIds[index];
+  const crossLeader = findTeamLeader(crossDeptId);
+  if (!crossLeader) {
+    // Skip this dept, try next
+    startCrossDeptCooperation(deptIds, index + 1, ctx);
+    return;
+  }
+
+  const { teamLeader, taskTitle, ceoMessage, leaderDeptName, leaderName, lang, taskId } = ctx;
+  const crossDeptName = getDeptName(crossDeptId);
+  const crossLeaderName = lang === "ko" ? (crossLeader.name_ko || crossLeader.name) : crossLeader.name;
+
+  // Notify remaining queue
+  if (deptIds.length > 1) {
+    const remaining = deptIds.length - index;
+    notifyCeo(`협업 요청 진행 중: ${crossDeptName} (${index + 1}/${deptIds.length}, 남은 ${remaining}팀 순차 진행)`, taskId);
+  }
+
+  const coopReq = pickL(l(
+    [`${crossLeaderName}님, 안녕하세요! 대표님 지시로 "${taskTitle}" 업무 진행 중인데, ${crossDeptName} 협조가 필요합니다. 도움 부탁드려요! 🤝`, `${crossLeaderName}님! "${taskTitle}" 건으로 ${crossDeptName} 지원이 필요합니다. 시간 되시면 협의 부탁드립니다.`],
+    [`Hi ${crossLeaderName}! We're working on "${taskTitle}" per CEO's directive and need ${crossDeptName}'s support. Could you help? 🤝`, `${crossLeaderName}, we need ${crossDeptName}'s input on "${taskTitle}". Let's sync when you have a moment.`],
+    [`${crossLeaderName}さん、CEO指示の"${taskTitle}"で${crossDeptName}の協力が必要です。お願いします！🤝`],
+    [`${crossLeaderName}，CEO安排的"${taskTitle}"需要${crossDeptName}配合，麻烦协调一下！🤝`],
+  ), lang);
+  sendAgentMessage(teamLeader, coopReq, "chat", "agent", crossLeader.id, taskId);
+
+  // Broadcast delivery animation event for UI
+  broadcast("cross_dept_delivery", {
+    from_agent_id: teamLeader.id,
+    to_agent_id: crossLeader.id,
+    task_title: taskTitle,
+  });
+
+  // Cross-department leader acknowledges AND creates a real task
+  const crossAckDelay = 1500 + Math.random() * 1000;
+  setTimeout(() => {
+    const crossSub = findBestSubordinate(crossDeptId, crossLeader.id);
+    const crossSubName = crossSub
+      ? (lang === "ko" ? (crossSub.name_ko || crossSub.name) : crossSub.name)
+      : null;
+
+    const crossAckMsg = crossSub
+      ? pickL(l(
+        [`네, ${leaderName}님! 확인했습니다. ${crossSubName}에게 바로 배정하겠습니다 👍`, `알겠습니다! ${crossSubName}가 지원하도록 하겠습니다. 진행 상황 공유드릴게요.`],
+        [`Sure, ${leaderName}! I'll assign ${crossSubName} to support right away 👍`, `Got it! ${crossSubName} will handle the ${crossDeptName} side. I'll keep you posted.`],
+        [`了解しました、${leaderName}さん！${crossSubName}を割り当てます 👍`],
+        [`好的，${leaderName}！安排${crossSubName}支援 👍`],
+      ), lang)
+      : pickL(l(
+        [`네, ${leaderName}님! 확인했습니다. 제가 직접 처리하겠습니다 👍`],
+        [`Sure, ${leaderName}! I'll handle it personally 👍`],
+        [`了解しました！私が直接対応します 👍`],
+        [`好的！我亲自来处理 👍`],
+      ), lang);
+    sendAgentMessage(crossLeader, crossAckMsg, "chat", "agent", null, taskId);
+
+    // Create actual task in the cross-department
+    const crossTaskId = randomUUID();
+    const ct = nowMs();
+    const crossTaskTitle = `[협업] ${taskTitle}`;
+    const crossDetectedPath = detectProjectPath(ceoMessage);
+    db.prepare(`
+      INSERT INTO tasks (id, title, description, department_id, status, priority, task_type, project_path, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'planned', 1, 'general', ?, ?, ?)
+    `).run(crossTaskId, crossTaskTitle, `[Cross-dept from ${leaderDeptName}] ${ceoMessage}`, crossDeptId, crossDetectedPath, ct, ct);
+    appendTaskLog(crossTaskId, "system", `Cross-dept request from ${leaderName} (${leaderDeptName})`);
+    broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(crossTaskId));
+
+    // Delegate to cross-dept subordinate and spawn CLI
+    const execAgent = crossSub || crossLeader;
+    const execName = lang === "ko" ? (execAgent.name_ko || execAgent.name) : execAgent.name;
+    const ct2 = nowMs();
+    db.prepare(
+      "UPDATE tasks SET assigned_agent_id = ?, status = 'in_progress', started_at = ?, updated_at = ? WHERE id = ?"
+    ).run(execAgent.id, ct2, ct2, crossTaskId);
+    db.prepare("UPDATE agents SET status = 'working', current_task_id = ? WHERE id = ?").run(crossTaskId, execAgent.id);
+    appendTaskLog(crossTaskId, "system", `${crossLeaderName} → ${execName}`);
+
+    broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(crossTaskId));
+    broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(execAgent.id));
+
+    // Register callback to start next department when this one finishes
+    if (index + 1 < deptIds.length) {
+      crossDeptNextCallbacks.set(crossTaskId, () => {
+        const nextDelay = 2000 + Math.random() * 1000;
+        setTimeout(() => {
+          startCrossDeptCooperation(deptIds, index + 1, ctx);
+        }, nextDelay);
+      });
+    }
+
+    // Actually spawn the CLI agent
+    const execProvider = execAgent.cli_provider || "claude";
+    if (["claude", "codex", "gemini", "opencode"].includes(execProvider)) {
+      const crossTaskData = db.prepare("SELECT * FROM tasks WHERE id = ?").get(crossTaskId) as {
+        title: string; description: string | null; project_path: string | null;
+      } | undefined;
+      if (crossTaskData) {
+        const projPath = resolveProjectPath(crossTaskData);
+        const logFilePath = path.join(logsDir, `${crossTaskId}.log`);
+        const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[execAgent.role] || execAgent.role;
+        const deptConstraint = getDeptRoleConstraint(crossDeptId, crossDeptName);
+        const crossConversationCtx = getRecentConversationContext(execAgent.id);
+        const spawnPrompt = [
+          `[Task] ${crossTaskData.title}`,
+          crossTaskData.description ? `\n${crossTaskData.description}` : "",
+          crossConversationCtx,
+          `\n---`,
+          `Agent: ${execAgent.name} (${roleLabel}, ${crossDeptName})`,
+          execAgent.personality ? `Personality: ${execAgent.personality}` : "",
+          deptConstraint,
+          `Please complete the task above thoroughly. Use the conversation context above if relevant.`,
+        ].filter(Boolean).join("\n");
+
+        appendTaskLog(crossTaskId, "system", `RUN start (agent=${execAgent.name}, provider=${execProvider})`);
+        const child = spawnCliAgent(crossTaskId, execProvider, spawnPrompt, projPath, logFilePath);
+        child.on("close", (code) => {
+          handleTaskRunComplete(crossTaskId, code ?? 1);
+        });
+
+        notifyCeo(`${crossDeptName} ${execName}가 '${taskTitle}' 협업 작업을 시작했습니다.`, crossTaskId);
+        startProgressTimer(crossTaskId, crossTaskData.title, crossDeptId);
+      }
+    }
+  }, crossAckDelay);
+}
+
+/**
+ * Detect project path from CEO message.
+ * Recognizes:
+ * 1. Absolute paths: /Users/classys/Projects/foo, ~/Projects/bar
+ * 2. Project names: "climpire 프로젝트", "claw-kanban에서"
+ * 3. Known project directories under ~/Projects
+ */
+function detectProjectPath(message: string): string | null {
+  const homeDir = os.homedir();
+  const projectsDir = path.join(homeDir, "Projects");
+  const projectsDirLower = path.join(homeDir, "projects");
+
+  // 1. Explicit absolute path in message
+  const absMatch = message.match(/(?:^|\s)(\/[\w./-]+)/);
+  if (absMatch) {
+    const p = absMatch[1];
+    // Check if it's a real directory
+    try {
+      if (fs.statSync(p).isDirectory()) return p;
+    } catch {}
+    // Check parent directory
+    const parent = path.dirname(p);
+    try {
+      if (fs.statSync(parent).isDirectory()) return parent;
+    } catch {}
+  }
+
+  // 2. ~ path
+  const tildeMatch = message.match(/~\/([\w./-]+)/);
+  if (tildeMatch) {
+    const expanded = path.join(homeDir, tildeMatch[1]);
+    try {
+      if (fs.statSync(expanded).isDirectory()) return expanded;
+    } catch {}
+  }
+
+  // 3. Scan known project directories and match by name
+  let knownProjects: string[] = [];
+  for (const pDir of [projectsDir, projectsDirLower]) {
+    try {
+      const entries = fs.readdirSync(pDir, { withFileTypes: true });
+      knownProjects = knownProjects.concat(
+        entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name)
+      );
+    } catch {}
+  }
+
+  // Match project names in the message (case-insensitive)
+  const msgLower = message.toLowerCase();
+  for (const proj of knownProjects) {
+    if (msgLower.includes(proj.toLowerCase())) {
+      // Return the actual path
+      const fullPath = path.join(projectsDir, proj);
+      try {
+        if (fs.statSync(fullPath).isDirectory()) return fullPath;
+      } catch {}
+      const fullPathLower = path.join(projectsDirLower, proj);
+      try {
+        if (fs.statSync(fullPathLower).isDirectory()) return fullPathLower;
+      } catch {}
+    }
+  }
+
+  return null;
+}
+
+/** Resolve project path: task.project_path → detect from message → cwd */
+function resolveProjectPath(task: { project_path?: string | null; description?: string | null; title?: string }): string {
+  if (task.project_path) return task.project_path;
+  // Try to detect from description or title
+  const detected = detectProjectPath(task.description || "") || detectProjectPath(task.title || "");
+  return detected || process.cwd();
+}
+
 function handleTaskDelegation(
   teamLeader: AgentRow,
   ceoMessage: string,
@@ -1936,11 +2537,15 @@ function handleTaskDelegation(
     const taskId = randomUUID();
     const t = nowMs();
     const taskTitle = ceoMessage.length > 60 ? ceoMessage.slice(0, 57) + "..." : ceoMessage;
+    const detectedPath = detectProjectPath(ceoMessage);
     db.prepare(`
-      INSERT INTO tasks (id, title, description, department_id, status, priority, task_type, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'planned', 1, 'general', ?, ?)
-    `).run(taskId, taskTitle, `[CEO] ${ceoMessage}`, leaderDeptId, t, t);
+      INSERT INTO tasks (id, title, description, department_id, status, priority, task_type, project_path, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'planned', 1, 'general', ?, ?, ?)
+    `).run(taskId, taskTitle, `[CEO] ${ceoMessage}`, leaderDeptId, detectedPath, t, t);
     appendTaskLog(taskId, "system", `CEO → ${leaderName}: ${ceoMessage}`);
+    if (detectedPath) {
+      appendTaskLog(taskId, "system", `Project path detected: ${detectedPath}`);
+    }
 
     broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
 
@@ -2021,16 +2626,20 @@ function handleTaskDelegation(
               title: string; description: string | null; project_path: string | null;
             } | undefined;
             if (taskData) {
-              const projPath = taskData.project_path || process.cwd();
+              const projPath = resolveProjectPath(taskData);
               const logFilePath = path.join(logsDir, `${taskId}.log`);
               const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[subordinate.role] || subordinate.role;
+              const deptConstraint = getDeptRoleConstraint(leaderDeptId, leaderDeptName);
+              const conversationCtx = getRecentConversationContext(subordinate.id);
               const spawnPrompt = [
                 `[Task] ${taskData.title}`,
                 taskData.description ? `\n${taskData.description}` : "",
+                conversationCtx,
                 `\n---`,
                 `Agent: ${subordinate.name} (${roleLabel}, ${leaderDeptName})`,
                 subordinate.personality ? `Personality: ${subordinate.personality}` : "",
-                `Please complete the task above thoroughly.`,
+                deptConstraint,
+                `Please complete the task above thoroughly. Use the conversation context above if relevant.`,
               ].filter(Boolean).join("\n");
 
               appendTaskLog(taskId, "system", `RUN start (agent=${subordinate.name}, provider=${subProvider})`);
@@ -2045,35 +2654,14 @@ function handleTaskDelegation(
           }
         }, subAckDelay);
 
-        // --- Step 4: Cross-department cooperation ---
+        // --- Step 4: Cross-department cooperation (SEQUENTIAL — one dept at a time) ---
         if (mentionedDepts.length > 0) {
           const crossDelay = 3000 + Math.random() * 1000;
           setTimeout(() => {
-            for (const crossDeptId of mentionedDepts) {
-              const crossLeader = findTeamLeader(crossDeptId);
-              if (!crossLeader) continue;
-              const crossDeptName = getDeptName(crossDeptId);
-              const crossLeaderName = lang === "ko" ? (crossLeader.name_ko || crossLeader.name) : crossLeader.name;
-
-              const coopReq = pickL(l(
-                [`${crossLeaderName}님, 안녕하세요! 대표님 지시로 "${taskTitle}" 업무 진행 중인데, ${crossDeptName} 협조가 필요합니다. 도움 부탁드려요! 🤝`, `${crossLeaderName}님! "${taskTitle}" 건으로 ${crossDeptName} 지원이 필요합니다. 시간 되시면 협의 부탁드립니다.`],
-                [`Hi ${crossLeaderName}! We're working on "${taskTitle}" per CEO's directive and need ${crossDeptName}'s support. Could you help? 🤝`, `${crossLeaderName}, we need ${crossDeptName}'s input on "${taskTitle}". Let's sync when you have a moment.`],
-                [`${crossLeaderName}さん、CEO指示の"${taskTitle}"で${crossDeptName}の協力が必要です。お願いします！🤝`],
-                [`${crossLeaderName}，CEO安排的"${taskTitle}"需要${crossDeptName}配合，麻烦协调一下！🤝`],
-              ), lang);
-              sendAgentMessage(teamLeader, coopReq, "chat", "agent", crossLeader.id, taskId);
-
-              const crossAckDelay = 1000 + Math.random() * 1000;
-              setTimeout(() => {
-                const crossAckMsg = pickL(l(
-                  [`네, ${leaderName}님! 확인했습니다. ${crossDeptName}에서 지원 가능한 부분 확인해보겠습니다 👍`, `알겠습니다! 우리 팀에서 관련 작업 서포트하겠습니다. 상세 내용 공유 부탁드려요.`, `확인했습니다, ${leaderName}님! ${crossDeptName} 리소스 확인 후 회신 드리겠습니다.`],
-                  [`Sure, ${leaderName}! I'll check what ${crossDeptName} can support 👍`, `Got it! Our team will back you up. Share the details when ready.`, `Confirmed, ${leaderName}! I'll check ${crossDeptName} resources and get back to you.`],
-                  [`了解しました、${leaderName}さん！${crossDeptName}でサポートできる部分を確認します 👍`],
-                  [`好的，${leaderName}！我看看${crossDeptName}能支持什么 👍`],
-                ), lang);
-                sendAgentMessage(crossLeader, crossAckMsg, "chat", "agent", null, taskId);
-              }, crossAckDelay);
-            }
+            // Start only the first department; subsequent ones are chained via crossDeptNextCallbacks
+            startCrossDeptCooperation(mentionedDepts, 0, {
+              teamLeader, taskTitle, ceoMessage, leaderDeptId, leaderDeptName, leaderName, lang, taskId,
+            });
           }, crossDelay);
         }
       }, delegateDelay);
@@ -2202,6 +2790,32 @@ app.post("/api/messages", (req, res) => {
   // Schedule agent auto-reply when CEO messages an agent
   if (senderType === "ceo" && receiverType === "agent" && receiverId) {
     scheduleAgentReply(receiverId, content, messageType);
+
+    // Check for @mentions to other departments/agents
+    const mentions = detectMentions(content);
+    if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
+      const senderAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(receiverId) as AgentRow | undefined;
+      if (senderAgent) {
+        const lang = detectLang(content);
+        const mentionDelay = 4000 + Math.random() * 2000; // After the main delegation starts
+        setTimeout(() => {
+          // Handle department mentions
+          for (const deptId of mentions.deptIds) {
+            if (deptId === senderAgent.department_id) continue; // Skip own department
+            handleMentionDelegation(senderAgent, deptId, content, lang);
+          }
+          // Handle agent mentions — find their department and delegate there
+          for (const agentId of mentions.agentIds) {
+            const mentioned = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+            if (mentioned && mentioned.department_id && mentioned.department_id !== senderAgent.department_id) {
+              if (!mentions.deptIds.includes(mentioned.department_id)) {
+                handleMentionDelegation(senderAgent, mentioned.department_id, content, lang);
+              }
+            }
+          }
+        }, mentionDelay);
+      }
+    }
   }
 
   res.json({ ok: true, message: msg });
@@ -2238,7 +2852,70 @@ app.post("/api/announcements", (req, res) => {
   // Team leaders respond to announcements with staggered delays
   scheduleAnnouncementReplies(content);
 
+  // Check for @mentions in announcements — trigger delegation
+  const mentions = detectMentions(content);
+  if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
+    const lang = detectLang(content);
+    const mentionDelay = 5000 + Math.random() * 2000;
+    setTimeout(() => {
+      const processedDepts = new Set<string>();
+
+      for (const deptId of mentions.deptIds) {
+        if (processedDepts.has(deptId)) continue;
+        processedDepts.add(deptId);
+        const leader = findTeamLeader(deptId);
+        if (leader) {
+          handleTaskDelegation(leader, content, "");
+        }
+      }
+
+      for (const agentId of mentions.agentIds) {
+        const mentioned = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+        if (mentioned?.department_id && !processedDepts.has(mentioned.department_id)) {
+          processedDepts.add(mentioned.department_id);
+          const leader = findTeamLeader(mentioned.department_id);
+          if (leader) {
+            handleTaskDelegation(leader, content, "");
+          }
+        }
+      }
+    }, mentionDelay);
+  }
+
   res.json({ ok: true, message: msg });
+});
+
+// Delete conversation messages
+app.delete("/api/messages", (req, res) => {
+  const agentId = firstQueryValue(req.query.agent_id);
+  const scope = firstQueryValue(req.query.scope) || "conversation"; // "conversation" or "all"
+
+  if (scope === "all") {
+    // Delete all messages (announcements + conversations)
+    const result = db.prepare("DELETE FROM messages").run();
+    broadcast("messages_cleared", { scope: "all" });
+    return res.json({ ok: true, deleted: result.changes });
+  }
+
+  if (agentId) {
+    // Delete messages for a specific agent conversation + announcements shown in that chat
+    const result = db.prepare(
+      `DELETE FROM messages WHERE
+        (sender_type = 'ceo' AND receiver_type = 'agent' AND receiver_id = ?)
+        OR (sender_type = 'agent' AND sender_id = ?)
+        OR receiver_type = 'all'
+        OR message_type = 'announcement'`
+    ).run(agentId, agentId);
+    broadcast("messages_cleared", { scope: "agent", agent_id: agentId });
+    return res.json({ ok: true, deleted: result.changes });
+  }
+
+  // Delete only announcements/broadcasts
+  const result = db.prepare(
+    "DELETE FROM messages WHERE receiver_type = 'all' OR message_type = 'announcement'"
+  ).run();
+  broadcast("messages_cleared", { scope: "announcements" });
+  res.json({ ok: true, deleted: result.changes });
 });
 
 // ---------------------------------------------------------------------------
@@ -2530,6 +3207,10 @@ app.get("/api/tasks/:id/terminal", (req, res) => {
 // OAuth credentials (simplified for CLImpire)
 // ---------------------------------------------------------------------------
 app.get("/api/oauth/status", (_req, res) => {
+  const home = os.homedir();
+  const now = nowMs();
+
+  // 1. DB-stored OAuth credentials
   const rows = db.prepare(
     "SELECT provider, source, email, scope, expires_at, created_at, updated_at FROM oauth_credentials"
   ).all() as Array<{
@@ -2542,7 +3223,16 @@ app.get("/api/oauth/status", (_req, res) => {
     updated_at: number;
   }>;
 
-  const providers: Record<string, unknown> = {};
+  const providers: Record<string, {
+    connected: boolean;
+    source: string | null;
+    email: string | null;
+    scope: string | null;
+    expires_at: number | null;
+    created_at: number;
+    updated_at: number;
+  }> = {};
+
   for (const row of rows) {
     providers[row.provider] = {
       connected: true,
@@ -2555,10 +3245,194 @@ app.get("/api/oauth/status", (_req, res) => {
     };
   }
 
+  // 2. Detect OAuth-based service credentials from local files
+  //    (These are OAuth services like GitHub, Google Cloud — NOT CLI tools)
+
+  // GitHub (gh CLI OAuth — used by Copilot, GitHub integrations)
+  if (!providers.github) {
+    try {
+      const hostsPath = path.join(home, ".config", "gh", "hosts.yml");
+      const raw = fs.readFileSync(hostsPath, "utf8");
+      // Parse simple YAML: look for "user:" line
+      const userMatch = raw.match(/user:\s*(\S+)/);
+      if (userMatch) {
+        const ghUser = userMatch[1];
+        // Check file mtime for created_at
+        const stat = fs.statSync(hostsPath);
+        providers.github = {
+          connected: true,
+          source: "gh-cli",
+          email: ghUser,
+          scope: "github.com",
+          expires_at: null,
+          created_at: stat.birthtimeMs,
+          updated_at: stat.mtimeMs,
+        };
+      }
+    } catch {}
+  }
+
+  // GitHub Copilot (separate OAuth from GitHub)
+  if (!providers.copilot) {
+    const copilotPaths = [
+      path.join(home, ".config", "github-copilot", "hosts.json"),
+      path.join(home, ".config", "github-copilot", "apps.json"),
+    ];
+    for (const cp of copilotPaths) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(cp, "utf8"));
+        if (raw && typeof raw === "object" && Object.keys(raw).length > 0) {
+          const stat = fs.statSync(cp);
+          const firstKey = Object.keys(raw)[0];
+          providers.copilot = {
+            connected: true,
+            source: "github-copilot",
+            email: raw[firstKey]?.user ?? null,
+            scope: "copilot",
+            expires_at: null,
+            created_at: stat.birthtimeMs,
+            updated_at: stat.mtimeMs,
+          };
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  // Google Cloud OAuth (gcloud application default credentials)
+  if (!providers.google) {
+    try {
+      const adcPath = path.join(home, ".config", "gcloud", "application_default_credentials.json");
+      const raw = JSON.parse(fs.readFileSync(adcPath, "utf8"));
+      if (raw?.client_id || raw?.type) {
+        const stat = fs.statSync(adcPath);
+        providers.google = {
+          connected: true,
+          source: "gcloud",
+          email: raw.client_email ?? raw.account ?? null,
+          scope: raw.type ?? "authorized_user",
+          expires_at: null,
+          created_at: stat.birthtimeMs,
+          updated_at: stat.mtimeMs,
+        };
+      }
+    } catch {}
+  }
+
+  // Antigravity
+  if (!providers.antigravity) {
+    const agPaths = [
+      path.join(home, ".antigravity", "auth.json"),
+      path.join(home, ".config", "antigravity", "auth.json"),
+      path.join(home, ".config", "antigravity", "credentials.json"),
+    ];
+    for (const ap of agPaths) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(ap, "utf8"));
+        if (raw && typeof raw === "object") {
+          const stat = fs.statSync(ap);
+          providers.antigravity = {
+            connected: true,
+            source: "antigravity-cli",
+            email: raw.email ?? raw.user ?? null,
+            scope: raw.scope ?? null,
+            expires_at: raw.expires_at ?? null,
+            created_at: stat.birthtimeMs,
+            updated_at: stat.mtimeMs,
+          };
+          break;
+        }
+      } catch {}
+    }
+  }
+
   res.json({
-    storageReady: Boolean(OAUTH_ENCRYPTION_SECRET),
+    storageReady: true,
     providers,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Git Worktree management endpoints
+// ---------------------------------------------------------------------------
+
+// GET /api/tasks/:id/diff — Get diff for review in UI
+app.get("/api/tasks/:id/diff", (req, res) => {
+  const id = String(req.params.id);
+  const wtInfo = taskWorktrees.get(id);
+  if (!wtInfo) {
+    return res.json({ ok: true, hasWorktree: false, diff: "", stat: "" });
+  }
+
+  try {
+    const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: wtInfo.projectPath, stdio: "pipe", timeout: 5000,
+    }).toString().trim();
+
+    const stat = execFileSync("git", ["diff", `${currentBranch}...${wtInfo.branchName}`, "--stat"], {
+      cwd: wtInfo.projectPath, stdio: "pipe", timeout: 10000,
+    }).toString().trim();
+
+    const diff = execFileSync("git", ["diff", `${currentBranch}...${wtInfo.branchName}`], {
+      cwd: wtInfo.projectPath, stdio: "pipe", timeout: 15000,
+    }).toString();
+
+    res.json({
+      ok: true,
+      hasWorktree: true,
+      branchName: wtInfo.branchName,
+      stat,
+      diff: diff.length > 50000 ? diff.slice(0, 50000) + "\n... (truncated)" : diff,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.json({ ok: false, error: msg });
+  }
+});
+
+// POST /api/tasks/:id/merge — Manually trigger merge
+app.post("/api/tasks/:id/merge", (req, res) => {
+  const id = String(req.params.id);
+  const wtInfo = taskWorktrees.get(id);
+  if (!wtInfo) {
+    return res.status(404).json({ error: "no_worktree", message: "No worktree found for this task" });
+  }
+
+  const result = mergeWorktree(wtInfo.projectPath, id);
+
+  if (result.success) {
+    cleanupWorktree(wtInfo.projectPath, id);
+    appendTaskLog(id, "system", `Manual merge 완료: ${result.message}`);
+    notifyCeo(`수동 병합 완료: ${result.message}`, id);
+  } else {
+    appendTaskLog(id, "system", `Manual merge 실패: ${result.message}`);
+  }
+
+  res.json({ ok: result.success, message: result.message, conflicts: result.conflicts });
+});
+
+// POST /api/tasks/:id/discard — Discard worktree changes (abandon branch)
+app.post("/api/tasks/:id/discard", (req, res) => {
+  const id = String(req.params.id);
+  const wtInfo = taskWorktrees.get(id);
+  if (!wtInfo) {
+    return res.status(404).json({ error: "no_worktree", message: "No worktree found for this task" });
+  }
+
+  cleanupWorktree(wtInfo.projectPath, id);
+  appendTaskLog(id, "system", "Worktree discarded (changes abandoned)");
+  notifyCeo(`작업 브랜치가 폐기되었습니다: climpire/${id.slice(0, 8)}`, id);
+
+  res.json({ ok: true, message: "Worktree discarded" });
+});
+
+// GET /api/worktrees — List all active worktrees
+app.get("/api/worktrees", (_req, res) => {
+  const entries: Array<{ taskId: string; branchName: string; worktreePath: string; projectPath: string }> = [];
+  for (const [taskId, info] of taskWorktrees) {
+    entries.push({ taskId, ...info });
+  }
+  res.json({ ok: true, worktrees: entries });
 });
 
 // ---------------------------------------------------------------------------

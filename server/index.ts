@@ -218,7 +218,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   description TEXT,
   department_id TEXT REFERENCES departments(id),
   assigned_agent_id TEXT REFERENCES agents(id),
-  status TEXT NOT NULL DEFAULT 'inbox' CHECK(status IN ('inbox','planned','collaborating','in_progress','review','done','cancelled')),
+  status TEXT NOT NULL DEFAULT 'inbox' CHECK(status IN ('inbox','planned','collaborating','in_progress','review','done','cancelled','pending')),
   priority INTEGER DEFAULT 0,
   task_type TEXT DEFAULT 'general' CHECK(task_type IN ('general','development','design','analysis','presentation','documentation')),
   project_path TEXT,
@@ -338,6 +338,80 @@ try { db.exec("ALTER TABLE subtasks ADD COLUMN delegated_task_id TEXT"); } catch
 
 // Cross-department collaboration: link collaboration task back to original task
 try { db.exec("ALTER TABLE tasks ADD COLUMN source_task_id TEXT"); } catch { /* already exists */ }
+
+function migrateLegacyTasksStatusSchema(): void {
+  const row = db.prepare(`
+    SELECT sql
+    FROM sqlite_master
+    WHERE type = 'table' AND name = 'tasks'
+  `).get() as { sql?: string } | undefined;
+  const ddl = (row?.sql ?? "").toLowerCase();
+  if (ddl.includes("'collaborating'") && ddl.includes("'pending'")) return;
+
+  console.log("[CLImpire] Migrating legacy tasks.status CHECK constraint");
+  const oldTable = "tasks_legacy_status_migration";
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    try {
+      db.exec(`ALTER TABLE tasks RENAME TO ${oldTable}`);
+      db.exec(`
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          description TEXT,
+          department_id TEXT REFERENCES departments(id),
+          assigned_agent_id TEXT REFERENCES agents(id),
+          status TEXT NOT NULL DEFAULT 'inbox'
+            CHECK(status IN ('inbox','planned','collaborating','in_progress','review','done','cancelled','pending')),
+          priority INTEGER DEFAULT 0,
+          task_type TEXT DEFAULT 'general'
+            CHECK(task_type IN ('general','development','design','analysis','presentation','documentation')),
+          project_path TEXT,
+          result TEXT,
+          started_at INTEGER,
+          completed_at INTEGER,
+          created_at INTEGER DEFAULT (unixepoch()*1000),
+          updated_at INTEGER DEFAULT (unixepoch()*1000),
+          source_task_id TEXT
+        );
+      `);
+
+      const cols = db.prepare(`PRAGMA table_info(${oldTable})`).all() as Array<{ name: string }>;
+      const hasSourceTaskId = cols.some((c) => c.name === "source_task_id");
+      const sourceTaskIdExpr = hasSourceTaskId ? "source_task_id" : "NULL AS source_task_id";
+      db.exec(`
+        INSERT INTO tasks (
+          id, title, description, department_id, assigned_agent_id,
+          status, priority, task_type, project_path, result,
+          started_at, completed_at, created_at, updated_at, source_task_id
+        )
+        SELECT
+          id, title, description, department_id, assigned_agent_id,
+          CASE
+            WHEN status IN ('inbox','planned','collaborating','in_progress','review','done','cancelled','pending')
+              THEN status
+            ELSE 'inbox'
+          END,
+          priority, task_type, project_path, result,
+          started_at, completed_at, created_at, updated_at, ${sourceTaskIdExpr}
+        FROM ${oldTable};
+      `);
+
+      db.exec(`DROP TABLE ${oldTable}`);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, updated_at DESC)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(assigned_agent_id)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_dept ON tasks(department_id)");
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+migrateLegacyTasksStatusSchema();
 
 // ---------------------------------------------------------------------------
 // Seed default data

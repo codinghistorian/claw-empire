@@ -11,7 +11,7 @@ import {
   AnimatedSprite,
   TextureStyle,
 } from "pixi.js";
-import type { Department, Agent, Task } from "../types";
+import type { Department, Agent, Task, MeetingPresence } from "../types";
 import type { CliStatusMap } from "../types";
 import { getCliStatus, getCliUsage, refreshCliUsage, type CliUsageEntry, type CliUsageWindow } from "../api";
 import { useI18n, type UiLanguage } from "../i18n";
@@ -47,6 +47,7 @@ interface OfficeViewProps {
   agents: Agent[];
   tasks: Task[];
   subAgents: SubAgent[];
+  meetingPresence?: MeetingPresence[];
   unreadAgentIds?: Set<string>;
   crossDeptDeliveries?: CrossDeptDelivery[];
   onCrossDeptDeliveryProcessed?: (id: string) => void;

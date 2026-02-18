@@ -18,6 +18,7 @@ import type {
   CompanySettings,
   CliStatusMap,
   SubTask,
+  MeetingPresence,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import {
@@ -111,7 +112,10 @@ export default function App() {
   const [unreadAgentIds, setUnreadAgentIds] = useState<Set<string>>(new Set());
   const [crossDeptDeliveries, setCrossDeptDeliveries] = useState<CrossDeptDelivery[]>([]);
   const [ceoOfficeCalls, setCeoOfficeCalls] = useState<CeoOfficeCall[]>([]);
+  const [meetingPresence, setMeetingPresence] = useState<MeetingPresence[]>([]);
   const [oauthResult, setOauthResult] = useState<OAuthCallbackResult | null>(null);
+  const viewRef = useRef<View>("office");
+  viewRef.current = view;
 
   // Ref to track currently open chat (avoids stale closures in WebSocket handlers)
   const activeChatRef = useRef<{ showChat: boolean; agentId: string | null }>({ showChat: false, agentId: null });
@@ -175,27 +179,7 @@ export default function App() {
         });
       }
       setSubtasks(subs);
-      if (presence.length > 0) {
-        setCeoOfficeCalls((prev) => {
-          const existingArrivals = new Set(
-            prev
-              .filter((call) => (call.action ?? "arrive") === "arrive")
-              .map((call) => call.fromAgentId),
-          );
-          const additions = presence
-            .filter((p) => !existingArrivals.has(p.agent_id))
-            .map((p) => ({
-              id: `ceo-sync-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              fromAgentId: p.agent_id,
-              seatIndex: p.seat_index,
-              phase: p.phase,
-              action: "arrive" as const,
-              instant: true,
-              holdUntil: p.until,
-            }));
-          return additions.length > 0 ? [...prev, ...additions] : prev;
-        });
-      }
+      setMeetingPresence(presence);
     } catch (e) {
       console.error("Failed to fetch data:", e);
     } finally {
@@ -213,6 +197,11 @@ export default function App() {
       api.getCliStatus(true).then(setCliStatus).catch(console.error);
     }
   }, [view, cliStatus]);
+
+  useEffect(() => {
+    if (view !== "office") return;
+    api.getMeetingPresence().then(setMeetingPresence).catch(() => {});
+  }, [view]);
 
   // WebSocket event handlers
   useEffect(() => {
@@ -287,6 +276,24 @@ export default function App() {
           hold_until?: number;
         };
         if (!p.from_agent_id) return;
+        const action = p.action ?? "arrive";
+        if (action === "arrive") {
+          const holdUntil = p.hold_until ?? (Date.now() + 600_000);
+          setMeetingPresence((prev) => {
+            const rest = prev.filter((row) => row.agent_id !== p.from_agent_id);
+            return [
+              ...rest,
+              {
+                agent_id: p.from_agent_id,
+                seat_index: p.seat_index ?? 0,
+                phase: p.phase ?? "kickoff",
+                until: holdUntil,
+              },
+            ];
+          });
+        } else if (action === "dismiss") {
+          setMeetingPresence((prev) => prev.filter((row) => row.agent_id !== p.from_agent_id));
+        }
         setCeoOfficeCalls((prev) => [
           ...prev,
           {
@@ -294,9 +301,10 @@ export default function App() {
             fromAgentId: p.from_agent_id,
             seatIndex: p.seat_index ?? 0,
             phase: p.phase ?? "kickoff",
-            action: p.action ?? "arrive",
+            action,
             line: p.line,
             holdUntil: p.hold_until,
+            instant: action === "arrive" && viewRef.current !== "office",
           },
         ]);
       }),
@@ -657,6 +665,7 @@ export default function App() {
                 agents={agents}
                 tasks={tasks}
                 subAgents={subAgents}
+                meetingPresence={meetingPresence}
                 unreadAgentIds={unreadAgentIds}
                 crossDeptDeliveries={crossDeptDeliveries}
                 onCrossDeptDeliveryProcessed={(id) =>

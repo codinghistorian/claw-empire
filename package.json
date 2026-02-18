@@ -1,6 +1,6 @@
 {
   "name": "climpire",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Claw-Empire - AI Agent Company Simulation. Command your CLI agent empire from the CEO desk.",
   "type": "module",
   "scripts": {

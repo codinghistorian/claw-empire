@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version" />
+  <img src="https://img.shields.io/badge/version-1.0.1-blue" alt="Version" />
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node.js 22+" />
   <img src="https://img.shields.io/badge/license-Apache%202.0-orange" alt="License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platform" />
@@ -20,6 +20,7 @@
 <p align="center">
   <a href="#빠른-시작">빠른 시작</a> &middot;
   <a href="#ai-installation-guide">AI 설치 가이드</a> &middot;
+  <a href="docs/releases/v1.0.1.md">릴리즈 노트</a> &middot;
   <a href="#openclaw-integration">OpenClaw 연동</a> &middot;
   <a href="#dollar-command-logic">$ 명령 로직</a> &middot;
   <a href="#주요-기능">주요 기능</a> &middot;
@@ -49,6 +50,19 @@ Claw-Empire는 CLI 기반 AI 코딩 어시스턴트 — **Claude Code**, **Codex
 - **로컬 퍼스트 & 프라이버시 보장** — 모든 데이터는 내 PC에. SQLite 데이터베이스, 클라우드 의존성 없음
 - **시각적이고 직관적** — 픽셀 아트 오피스 뷰가 AI 오케스트레이션을 즐겁고 투명하게 만들어줌
 - **진정한 자율 협업** — 에이전트들이 독립된 git worktree에서 작업하고, 회의에 참석하며, 결과물을 생산
+
+---
+
+## 최신 릴리즈 (v1.0.1)
+
+- 다중 OAuth 계정 풀: 여러 계정 동시 활성, 자동 스왑 ON/OFF, 계정별 모델 오버라이드/우선순위
+- 오피스 에이전트 단위 OAuth 계정 선택: Copilot/Antigravity 실행 시 선택 계정 우선 사용
+- 작업자 1:1 채팅 지시가 실제 Task 생성/실행 플로우로 연결되도록 개선
+- 신규 OAuth 계정 기본 라벨을 순번화: `Copi-1`, `Copi-2`, `Anti-1`, `Anti-2`
+- 모바일 오피스 조작 추가: 우측 하단 가상 방향 패드 + 하단 중앙 `Enter` 버튼
+- 모바일 CEO 화면 추적 개선: 이동 시 가로/세로 모두 뷰포트 자동 추적
+- CEO 이동 속도 `3.5`로 상향 조정
+- 상세 문서: [`docs/releases/v1.0.1.md`](docs/releases/v1.0.1.md)
 
 ---
 

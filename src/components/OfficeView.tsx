@@ -95,6 +95,37 @@ function detachNode(node: Container): void {
   node.parent?.removeChild(node);
 }
 
+type ScrollAxis = "x" | "y";
+
+function isScrollableOverflowValue(value: string): boolean {
+  return value === "auto" || value === "scroll" || value === "overlay";
+}
+
+function canScrollOnAxis(el: HTMLElement, axis: ScrollAxis): boolean {
+  const style = window.getComputedStyle(el);
+  if (axis === "y") {
+    return isScrollableOverflowValue(style.overflowY) && el.scrollHeight > el.clientHeight + 1;
+  }
+  return isScrollableOverflowValue(style.overflowX) && el.scrollWidth > el.clientWidth + 1;
+}
+
+function findScrollContainer(start: HTMLElement | null, axis: ScrollAxis): HTMLElement | null {
+  let current = start?.parentElement ?? null;
+  let fallback: HTMLElement | null = null;
+  while (current) {
+    const style = window.getComputedStyle(current);
+    const overflowY = style.overflowY;
+    const overflowX = style.overflowX;
+    const hasScrollableStyle = axis === "y"
+      ? isScrollableOverflowValue(overflowY)
+      : isScrollableOverflowValue(overflowX);
+    if (!fallback && hasScrollableStyle) fallback = current;
+    if (canScrollOnAxis(current, axis)) return current;
+    current = current.parentElement;
+  }
+  return fallback;
+}
+
 /* ================================================================== */
 /*  Constants                                                          */
 /* ================================================================== */
@@ -112,11 +143,18 @@ const SLOT_H = 120;
 const COLS_PER_ROW = 3;
 const ROOM_PAD = 16;
 const TILE = 20;
-const CEO_SPEED = 2.5;
+const CEO_SPEED = 3.5;
 const DELIVERY_SPEED = 0.012;
 
 const BREAK_ROOM_H = 110;
 const BREAK_ROOM_GAP = 16;
+const MOBILE_MOVE_CODES = {
+  up: ["ArrowUp", "KeyW"],
+  down: ["ArrowDown", "KeyS"],
+  left: ["ArrowLeft", "KeyA"],
+  right: ["ArrowRight", "KeyD"],
+} as const;
+type MobileMoveDirection = keyof typeof MOBILE_MOVE_CODES;
 
 const BREAK_THEME = {
   floor1: 0x2a2218,
@@ -145,10 +183,16 @@ const LOCALE_TEXT = {
   statsProgress: { ko: "진행", en: "In Progress", ja: "進行", zh: "进行中" },
   statsDone: { ko: "완료", en: "Done", ja: "完了", zh: "已完成" },
   hint: {
-    ko: "WASD/방향키: CEO 이동  |  Enter: 상호작용",
-    en: "WASD/Arrow: CEO Move  |  Enter: Interact",
-    ja: "WASD/矢印キー: CEO移動  |  Enter: 操作",
-    zh: "WASD/方向键: CEO移动  |  Enter: 交互",
+    ko: "WASD/방향키/가상패드: CEO 이동  |  Enter: 상호작용",
+    en: "WASD/Arrow/Virtual Pad: CEO Move  |  Enter: Interact",
+    ja: "WASD/矢印キー/仮想パッド: CEO移動  |  Enter: 操作",
+    zh: "WASD/方向键/虚拟手柄: CEO移动  |  Enter: 交互",
+  },
+  mobileEnter: {
+    ko: "Enter",
+    en: "Enter",
+    ja: "Enter",
+    zh: "Enter",
   },
   noAssignedAgent: {
     ko: "배정된 직원 없음",
@@ -746,6 +790,117 @@ export default function OfficeView({
   activeMeetingTaskIdRef.current = activeMeetingTaskId ?? null;
   const meetingMinutesOpenRef = useRef<typeof onOpenActiveMeetingMinutes>(onOpenActiveMeetingMinutes);
   meetingMinutesOpenRef.current = onOpenActiveMeetingMinutes;
+  const [showVirtualPad, setShowVirtualPad] = useState(false);
+  const showVirtualPadRef = useRef(showVirtualPad);
+  showVirtualPadRef.current = showVirtualPad;
+  const scrollHostXRef = useRef<HTMLElement | null>(null);
+  const scrollHostYRef = useRef<HTMLElement | null>(null);
+
+  const triggerDepartmentInteract = useCallback(() => {
+    const cx = ceoPosRef.current.x;
+    const cy = ceoPosRef.current.y;
+    for (const r of roomRectsRef.current) {
+      if (cx >= r.x && cx <= r.x + r.w && cy >= r.y - 10 && cy <= r.y + r.h) {
+        cbRef.current.onSelectDepartment(r.dept);
+        break;
+      }
+    }
+  }, []);
+
+  const setMoveDirectionPressed = useCallback((direction: MobileMoveDirection, pressed: boolean) => {
+    for (const code of MOBILE_MOVE_CODES[direction]) {
+      keysRef.current[code] = pressed;
+    }
+  }, []);
+
+  const clearVirtualMovement = useCallback(() => {
+    (Object.keys(MOBILE_MOVE_CODES) as MobileMoveDirection[]).forEach((direction) => {
+      setMoveDirectionPressed(direction, false);
+    });
+  }, [setMoveDirectionPressed]);
+
+  const followCeoInView = useCallback(() => {
+    if (!showVirtualPadRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const scaleX = officeWRef.current > 0 ? container.clientWidth / officeWRef.current : 1;
+    const scaleY = totalHRef.current > 0 ? container.clientHeight / totalHRef.current : scaleX;
+
+    let hostX = scrollHostXRef.current;
+    if (!hostX || !canScrollOnAxis(hostX, "x")) {
+      hostX = findScrollContainer(container, "x") ?? (document.scrollingElement as HTMLElement | null);
+      scrollHostXRef.current = hostX;
+    }
+
+    let hostY = scrollHostYRef.current;
+    if (!hostY || !canScrollOnAxis(hostY, "y")) {
+      hostY = findScrollContainer(container, "y") ?? (document.scrollingElement as HTMLElement | null);
+      scrollHostYRef.current = hostY;
+    }
+
+    let nextLeft: number | null = null;
+    let movedX = false;
+    if (hostX) {
+      const hostRectX = hostX.getBoundingClientRect();
+      const ceoInHostX = containerRect.left - hostRectX.left + ceoPosRef.current.x * scaleX;
+      const ceoContentX = hostX.scrollLeft + ceoInHostX;
+      const targetLeft = ceoContentX - hostX.clientWidth * 0.45;
+      const maxLeft = Math.max(0, hostX.scrollWidth - hostX.clientWidth);
+      nextLeft = Math.max(0, Math.min(maxLeft, targetLeft));
+      movedX = Math.abs(hostX.scrollLeft - nextLeft) > 1;
+    }
+
+    let nextTop: number | null = null;
+    let movedY = false;
+    if (hostY) {
+      const hostRectY = hostY.getBoundingClientRect();
+      const ceoInHostY = containerRect.top - hostRectY.top + ceoPosRef.current.y * scaleY;
+      const ceoContentY = hostY.scrollTop + ceoInHostY;
+      const targetTop = ceoContentY - hostY.clientHeight * 0.45;
+      const maxTop = Math.max(0, hostY.scrollHeight - hostY.clientHeight);
+      nextTop = Math.max(0, Math.min(maxTop, targetTop));
+      movedY = Math.abs(hostY.scrollTop - nextTop) > 1;
+    }
+
+    if (hostX && hostY && hostX === hostY) {
+      if (movedX || movedY) {
+        hostX.scrollTo({
+          left: movedX && nextLeft !== null ? nextLeft : hostX.scrollLeft,
+          top: movedY && nextTop !== null ? nextTop : hostX.scrollTop,
+          behavior: "auto",
+        });
+      }
+      return;
+    }
+
+    if (hostX && movedX && nextLeft !== null) {
+      hostX.scrollTo({ left: nextLeft, top: hostX.scrollTop, behavior: "auto" });
+    }
+    if (hostY && movedY && nextTop !== null) {
+      hostY.scrollTo({ left: hostY.scrollLeft, top: nextTop, behavior: "auto" });
+    }
+  }, []);
+
+  useEffect(() => {
+    const updateVirtualPadVisibility = () => {
+      const isCoarsePointer = window.matchMedia("(pointer: coarse)").matches;
+      const isNarrowViewport = window.innerWidth <= 1024;
+      setShowVirtualPad(isCoarsePointer || isNarrowViewport);
+    };
+    updateVirtualPadVisibility();
+    window.addEventListener("resize", updateVirtualPadVisibility);
+    return () => window.removeEventListener("resize", updateVirtualPadVisibility);
+  }, []);
+
+  useEffect(() => {
+    if (!showVirtualPad) clearVirtualMovement();
+  }, [showVirtualPad, clearVirtualMovement]);
+
+  useEffect(() => () => {
+    clearVirtualMovement();
+  }, [clearVirtualMovement]);
 
   /* ── BUILD SCENE (no app destroy, just stage clear + rebuild) ── */
   const buildScene = useCallback(() => {
@@ -1535,6 +1690,8 @@ export default function OfficeView({
     if (!el) return;
     destroyedRef.current = false;
     const currentInitId = ++initIdRef.current;
+    scrollHostXRef.current = findScrollContainer(el, "x");
+    scrollHostYRef.current = findScrollContainer(el, "y");
 
     async function init() {
       if (!el) return;
@@ -1581,6 +1738,7 @@ export default function OfficeView({
       // Initial scene
       buildScene();
       initDoneRef.current = true;
+      followCeoInView();
 
       // ── ANIMATION TICKER ──
       app.ticker.add(() => {
@@ -1600,6 +1758,7 @@ export default function OfficeView({
             ceoPosRef.current.x = Math.max(28, Math.min(officeWRef.current - 28, ceoPosRef.current.x + dx));
             ceoPosRef.current.y = Math.max(18, Math.min(totalHRef.current - 28, ceoPosRef.current.y + dy));
             ceo.position.set(ceoPosRef.current.x, ceoPosRef.current.y);
+            followCeoInView();
           }
 
           // Crown bob
@@ -1937,13 +2096,8 @@ export default function OfficeView({
         keysRef.current[e.code] = true;
       }
       if (e.code === "Enter" || e.code === "Space") {
-        const cx = ceoPosRef.current.x, cy = ceoPosRef.current.y;
-        for (const r of roomRectsRef.current) {
-          if (cx >= r.x && cx <= r.x + r.w && cy >= r.y - 10 && cy <= r.y + r.h) {
-            cbRef.current.onSelectDepartment(r.dept);
-            break;
-          }
-        }
+        e.preventDefault();
+        triggerDepartmentInteract();
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -1975,12 +2129,14 @@ export default function OfficeView({
       window.removeEventListener("keyup", onKeyUp);
       deliveriesRef.current = [];
       initDoneRef.current = false;
+      scrollHostXRef.current = null;
+      scrollHostYRef.current = null;
       if (appRef.current) {
         appRef.current.destroy(true, { children: true });
         appRef.current = null;
       }
     };
-  }, [buildScene]);
+  }, [buildScene, triggerDepartmentInteract, followCeoInView]);
 
   /* ── REBUILD SCENE on data change (no app destroy!) ── */
   useEffect(() => {
@@ -2402,14 +2558,94 @@ export default function OfficeView({
     return s?.installed && s?.authenticated;
   });
 
+  const mobilePadButtonClass =
+    "pointer-events-auto flex h-9 w-9 items-center justify-center rounded-lg border border-slate-300/70 bg-transparent text-sm font-bold text-slate-100 shadow-none active:scale-95 active:bg-slate-500/20";
+
   return (
     <div className="w-full overflow-auto" style={{ minHeight: "100%" }}>
-      <div
-        ref={containerRef}
-        className="mx-auto"
-        style={{ maxWidth: "100%", lineHeight: 0, outline: "none" }}
-        tabIndex={0}
-      />
+      <div className="relative mx-auto w-full">
+        <div
+          ref={containerRef}
+          className="mx-auto"
+          style={{ maxWidth: "100%", lineHeight: 0, outline: "none" }}
+          tabIndex={0}
+        />
+
+        {showVirtualPad && (
+          <>
+            <div className="pointer-events-none fixed bottom-3 left-1/2 z-50 -translate-x-1/2">
+              <button
+                type="button"
+                aria-label="Interact"
+                className="pointer-events-auto flex h-10 min-w-12 items-center justify-center rounded-xl border border-amber-300/80 bg-amber-500/85 px-2 text-[11px] font-bold tracking-wide text-slate-950 shadow-none active:scale-95 active:bg-amber-400"
+                style={{ touchAction: "none" }}
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={triggerDepartmentInteract}
+              >
+                {t(LOCALE_TEXT.mobileEnter)}
+              </button>
+            </div>
+
+            <div className="pointer-events-none fixed bottom-3 right-3 z-50">
+              <div className="grid grid-cols-3 gap-1">
+                <div />
+                <button
+                  type="button"
+                  aria-label="Move up"
+                  className={mobilePadButtonClass}
+                  style={{ touchAction: "none" }}
+                  onPointerDown={() => setMoveDirectionPressed("up", true)}
+                  onPointerUp={() => setMoveDirectionPressed("up", false)}
+                  onPointerCancel={() => setMoveDirectionPressed("up", false)}
+                  onPointerLeave={() => setMoveDirectionPressed("up", false)}
+                >
+                  ▲
+                </button>
+                <div />
+                <button
+                  type="button"
+                  aria-label="Move left"
+                  className={mobilePadButtonClass}
+                  style={{ touchAction: "none" }}
+                  onPointerDown={() => setMoveDirectionPressed("left", true)}
+                  onPointerUp={() => setMoveDirectionPressed("left", false)}
+                  onPointerCancel={() => setMoveDirectionPressed("left", false)}
+                  onPointerLeave={() => setMoveDirectionPressed("left", false)}
+                >
+                  ◀
+                </button>
+                <div className="h-9 w-9" />
+                <button
+                  type="button"
+                  aria-label="Move right"
+                  className={mobilePadButtonClass}
+                  style={{ touchAction: "none" }}
+                  onPointerDown={() => setMoveDirectionPressed("right", true)}
+                  onPointerUp={() => setMoveDirectionPressed("right", false)}
+                  onPointerCancel={() => setMoveDirectionPressed("right", false)}
+                  onPointerLeave={() => setMoveDirectionPressed("right", false)}
+                >
+                  ▶
+                </button>
+                <div />
+                <button
+                  type="button"
+                  aria-label="Move down"
+                  className={mobilePadButtonClass}
+                  style={{ touchAction: "none" }}
+                  onPointerDown={() => setMoveDirectionPressed("down", true)}
+                  onPointerUp={() => setMoveDirectionPressed("down", false)}
+                  onPointerCancel={() => setMoveDirectionPressed("down", false)}
+                  onPointerLeave={() => setMoveDirectionPressed("down", false)}
+                >
+                  ▼
+                </button>
+                <div />
+              </div>
+            </div>
+          </>
+        )}
+      </div>
 
       {/* CLI Usage Gauges */}
       {connectedClis.length > 0 && (

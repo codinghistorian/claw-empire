@@ -50,9 +50,9 @@ blocked_tracked=(
   ".env"
   ".env.local"
   ".env.production"
-  "climpire.sqlite"
-  "climpire.sqlite-shm"
-  "climpire.sqlite-wal"
+  "claw-empire.sqlite"
+  "claw-empire.sqlite-shm"
+  "claw-empire.sqlite-wal"
 )
 for path in "${blocked_tracked[@]}"; do
   if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then

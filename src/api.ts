@@ -368,6 +368,30 @@ export async function getSkills(): Promise<SkillEntry[]> {
   return j.skills;
 }
 
+// Gateway Channel Messaging
+export type GatewayTarget = {
+  sessionKey: string;
+  displayName: string;
+  channel: string;
+  to: string;
+};
+
+export async function getGatewayTargets(): Promise<GatewayTarget[]> {
+  const r = await fetch(`${base}/api/gateway/targets`);
+  if (!r.ok) return [];
+  const data = await r.json();
+  return data?.targets ?? [];
+}
+
+export async function sendGatewayMessage(sessionKey: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  const r = await fetch(`${base}/api/gateway/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionKey, text }),
+  });
+  return r.json();
+}
+
 // SubTasks
 export async function getActiveSubtasks(): Promise<SubTask[]> {
   const j = await request<{ subtasks: SubTask[] }>('/api/subtasks?active=1');

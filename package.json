@@ -11,6 +11,7 @@
     "start:tailscale": "cross-env HOST=0.0.0.0 tsx server/index.ts",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "setup": "node scripts/setup.mjs",
     "arch:map": "node scripts/generate-architecture-report.mjs",
     "preflight:public": "bash scripts/preflight-public.sh"
   },

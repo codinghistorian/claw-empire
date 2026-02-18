@@ -241,11 +241,18 @@ export interface CompanySettings {
 }
 
 export const DEFAULT_SETTINGS: CompanySettings = {
-  companyName: 'Claw-Empire Corp.',
+  companyName: 'Claw-Empire',
   ceoName: 'CEO',
   autoAssign: true,
   theme: 'dark',
   language: 'en',
   defaultProvider: 'claude',
-  providerModelConfig: {},
+  providerModelConfig: {
+    claude:      { model: "claude-opus-4-6", subModel: "claude-sonnet-4-6" },
+    codex:       { model: "gpt-5.3-codex", reasoningLevel: "xhigh", subModel: "gpt-5.3-codex", subModelReasoningLevel: "high" },
+    gemini:      { model: "gemini-3-pro-preview" },
+    opencode:    { model: "github-copilot/claude-sonnet-4.6" },
+    copilot:     { model: "github-copilot/claude-sonnet-4.6" },
+    antigravity: { model: "google/antigravity-gemini-3-pro" },
+  },
 };

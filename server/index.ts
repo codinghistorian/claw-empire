@@ -48,6 +48,7 @@ const PKG_VERSION: string = (() => {
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const OAUTH_BASE_HOST = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
+const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG ?? "";
 
 // ---------------------------------------------------------------------------
 // Express setup
@@ -155,7 +156,18 @@ const isProduction = !process.env.VITE_DEV && fs.existsSync(path.join(distDir, "
 // ---------------------------------------------------------------------------
 // Database setup
 // ---------------------------------------------------------------------------
-const dbPath = process.env.DB_PATH ?? path.join(process.cwd(), "climpire.sqlite");
+const defaultDbPath = path.join(process.cwd(), "claw-empire.sqlite");
+const legacyDbPath = path.join(process.cwd(), "climpire.sqlite");
+
+if (!process.env.DB_PATH && !fs.existsSync(defaultDbPath) && fs.existsSync(legacyDbPath)) {
+  fs.renameSync(legacyDbPath, defaultDbPath);
+  for (const suffix of ["-wal", "-shm"]) {
+    const src = legacyDbPath + suffix;
+    if (fs.existsSync(src)) fs.renameSync(src, defaultDbPath + suffix);
+  }
+  console.log("[Claw-Empire] Migrated database: climpire.sqlite → claw-empire.sqlite");
+}
+const dbPath = process.env.DB_PATH ?? defaultDbPath;
 const db = new DatabaseSync(dbPath);
 db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA busy_timeout = 3000");
@@ -165,6 +177,212 @@ const logsDir = process.env.LOGS_DIR ?? path.join(process.cwd(), "logs");
 try {
   fs.mkdirSync(logsDir, { recursive: true });
 } catch { /* ignore */ }
+
+// ---------------------------------------------------------------------------
+// OpenClaw Gateway wake (ported from claw-kanban)
+// ---------------------------------------------------------------------------
+const GATEWAY_PROTOCOL_VERSION = 3;
+const GATEWAY_WS_PATH = "/ws";
+const WAKE_DEBOUNCE_DEFAULT_MS = 12_000;
+const wakeDebounce = new Map<string, number>();
+let cachedGateway: { url: string; token?: string; loadedAt: number } | null = null;
+
+function loadGatewayConfig(): { url: string; token?: string } | null {
+  if (!OPENCLAW_CONFIG_PATH) return null;
+
+  const now = Date.now();
+  if (cachedGateway && now - cachedGateway.loadedAt < 30_000) {
+    return { url: cachedGateway.url, token: cachedGateway.token };
+  }
+  try {
+    const raw = fs.readFileSync(OPENCLAW_CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw) as {
+      gateway?: {
+        port?: number;
+        auth?: { token?: string };
+      };
+    };
+    const port = Number(parsed?.gateway?.port);
+    if (!Number.isFinite(port) || port <= 0) {
+      console.warn(`[Claw-Empire] invalid gateway.port in ${OPENCLAW_CONFIG_PATH}`);
+      return null;
+    }
+    const token =
+      typeof parsed?.gateway?.auth?.token === "string" ? parsed.gateway.auth.token : undefined;
+    const url = `ws://127.0.0.1:${port}${GATEWAY_WS_PATH}`;
+    cachedGateway = { url, token, loadedAt: now };
+    return { url, token };
+  } catch (err) {
+    console.warn(`[Claw-Empire] failed to read gateway config: ${String(err)}`);
+    return null;
+  }
+}
+
+function shouldSendWake(key: string, debounceMs: number): boolean {
+  const now = Date.now();
+  const last = wakeDebounce.get(key);
+  if (last && now - last < debounceMs) {
+    return false;
+  }
+  wakeDebounce.set(key, now);
+  if (wakeDebounce.size > 2000) {
+    for (const [k, ts] of wakeDebounce) {
+      if (now - ts > debounceMs * 4) {
+        wakeDebounce.delete(k);
+      }
+    }
+  }
+  return true;
+}
+
+async function sendGatewayWake(text: string): Promise<void> {
+  const config = loadGatewayConfig();
+  if (!config) {
+    throw new Error("gateway config unavailable");
+  }
+
+  const connectId = randomUUID();
+  const wakeId = randomUUID();
+  const instanceId = randomUUID();
+
+  return await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const ws = new WebSocket(config.url);
+
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    };
+
+    const send = (payload: unknown) => {
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
+    const connectParams = {
+      minProtocol: GATEWAY_PROTOCOL_VERSION,
+      maxProtocol: GATEWAY_PROTOCOL_VERSION,
+      client: {
+        id: "cli",
+        displayName: "Claw-Empire",
+        version: PKG_VERSION,
+        platform: process.platform,
+        mode: "backend",
+        instanceId,
+      },
+      ...(config.token ? { auth: { token: config.token } } : {}),
+      role: "operator",
+      scopes: ["operator.admin"],
+      caps: [],
+    };
+
+    ws.on("open", () => {
+      send({ type: "req", id: connectId, method: "connect", params: connectParams });
+    });
+
+    ws.on("message", (data: Buffer | string) => {
+      const raw = typeof data === "string" ? data : data.toString("utf8");
+      if (!raw) return;
+      let msg: any;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!msg || msg.type !== "res") return;
+      if (msg.id === connectId) {
+        if (!msg.ok) {
+          finish(new Error(msg.error?.message ?? "gateway connect failed"));
+          return;
+        }
+        send({ type: "req", id: wakeId, method: "wake", params: { mode: "now", text } });
+        return;
+      }
+      if (msg.id === wakeId) {
+        if (!msg.ok) {
+          finish(new Error(msg.error?.message ?? "gateway wake failed"));
+          return;
+        }
+        finish();
+      }
+    });
+
+    ws.on("error", () => {
+      finish(new Error("gateway socket error"));
+    });
+
+    ws.on("close", () => {
+      finish(new Error("gateway socket closed"));
+    });
+
+    timer = setTimeout(() => {
+      finish(new Error("gateway wake timeout"));
+    }, 8000);
+    (timer as NodeJS.Timeout).unref?.();
+  });
+}
+
+function queueWake(params: { key: string; text: string; debounceMs?: number }) {
+  if (!OPENCLAW_CONFIG_PATH) return;
+  const debounceMs = params.debounceMs ?? WAKE_DEBOUNCE_DEFAULT_MS;
+  if (!shouldSendWake(params.key, debounceMs)) return;
+  void sendGatewayWake(params.text).catch((err) => {
+    console.warn(`[Claw-Empire] wake failed (${params.key}): ${String(err)}`);
+  });
+}
+
+function notifyTaskStatus(taskId: string, title: string, status: string): void {
+  if (!OPENCLAW_CONFIG_PATH) return;
+  const emoji = status === "in_progress" ? "\u{1F680}" : status === "review" ? "\u{1F50D}" : status === "done" ? "\u2705" : "\u{1F4CB}";
+  const label = status === "in_progress" ? "진행 시작" : status === "review" ? "검토 중" : status === "done" ? "완료" : status;
+  queueWake({
+    key: `task:${taskId}:${status}`,
+    text: `${emoji} [${label}] ${title}`,
+    debounceMs: 5_000,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Gateway HTTP REST invoke (for /tools/invoke endpoint)
+// ---------------------------------------------------------------------------
+async function gatewayHttpInvoke(req: { tool: string; action?: string; args?: Record<string, any> }): Promise<any> {
+  const config = loadGatewayConfig();
+  if (!config) throw new Error("gateway config unavailable");
+  const portMatch = config.url.match(/:(\d+)/);
+  if (!portMatch) throw new Error("cannot extract port from gateway URL");
+  const baseUrl = `http://127.0.0.1:${portMatch[1]}`;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (config.token) headers["authorization"] = `Bearer ${config.token}`;
+  const r = await fetch(`${baseUrl}/tools/invoke`, {
+    method: "POST", headers,
+    body: JSON.stringify(req),
+  });
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`gateway invoke failed: ${r.status}${body ? `: ${body}` : ""}`);
+  }
+  const data = await r.json() as { ok: boolean; result?: any; error?: { message?: string } };
+  if (!data.ok) throw new Error(data.error?.message || "tool invoke error");
+  return data.result;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -679,10 +897,19 @@ if (agentCount === 0) {
   const settingsCount = (db.prepare("SELECT COUNT(*) as c FROM settings").get() as { c: number }).c;
   if (settingsCount === 0) {
     const insertSetting = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
-    insertSetting.run("companyName", "Claw-Empire Corp.");
+    insertSetting.run("companyName", "Claw-Empire");
     insertSetting.run("ceoName", "CEO");
     insertSetting.run("autoAssign", "true");
     insertSetting.run("language", "en");
+    insertSetting.run("defaultProvider", "claude");
+    insertSetting.run("providerModelConfig", JSON.stringify({
+      claude:      { model: "claude-opus-4-6", subModel: "claude-sonnet-4-6" },
+      codex:       { model: "gpt-5.3-codex", reasoningLevel: "xhigh", subModel: "gpt-5.3-codex", subModelReasoningLevel: "high" },
+      gemini:      { model: "gemini-3-pro-preview" },
+      opencode:    { model: "github-copilot/claude-sonnet-4.6" },
+      copilot:     { model: "github-copilot/claude-sonnet-4.6" },
+      antigravity: { model: "google/antigravity-gemini-3-pro" },
+    }));
     console.log("[Claw-Empire] Seeded default settings");
   }
 
@@ -1187,13 +1414,22 @@ function summarizeForMeetingBubble(text: string, maxChars = 96): string {
 function classifyMeetingReviewDecision(text: string): MeetingReviewDecision {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) return "reviewing";
-  if (/(보완|수정|보류|리스크|미흡|미완|추가.?필요|재검토|중단|불가|hold|revise|revision|changes?\s+requested|required|pending|risk|block|missing|incomplete|not\s+ready|保留|修正|风险|补充|未完成|暂缓|差し戻し)/i.test(cleaned)) {
-    return "hold";
-  }
-  if (/(승인|통과|문제없|진행.?가능|배포.?가능|approve|approved|lgtm|ship\s+it|go\s+ahead|承認|批准|通过|可发布)/i.test(cleaned)) {
-    return "approved";
-  }
+  const hasApprovalSignal = /(승인|통과|문제없|진행.?가능|배포.?가능|approve|approved|lgtm|ship\s+it|go\s+ahead|承認|批准|通过|可发布)/i
+    .test(cleaned);
+  const hasNoRiskSignal = /(리스크\s*(없|없음|없습니다|없는|없이)|위험\s*(없|없음|없습니다|없는|없이)|문제\s*없|이슈\s*없|no\s+risk|without\s+risk|risk[-\s]?free|no\s+issue|no\s+blocker|リスク(は)?(ありません|なし|無し)|問題ありません|无风险|没有风险|無風險|无问题)/i
+    .test(cleaned);
+  const hasConditionalOrHoldSignal = /(조건부|보완|수정|보류|리스크|미흡|미완|추가.?필요|재검토|중단|불가|hold|revise|revision|changes?\s+requested|required|pending|risk|block|missing|incomplete|not\s+ready|保留|修正|风险|补充|未完成|暂缓|差し戻し)/i
+    .test(cleaned);
+
+  // "No risk / no issue + approval" should not be downgraded to hold.
+  if (hasApprovalSignal && hasNoRiskSignal) return "approved";
+  if (hasConditionalOrHoldSignal) return "hold";
+  if (hasApprovalSignal || hasNoRiskSignal) return "approved";
   return "reviewing";
+}
+
+function wantsReviewRevision(content: string): boolean {
+  return classifyMeetingReviewDecision(content) === "hold";
 }
 
 function formatMeetingTranscript(transcript: MeetingTranscriptEntry[]): string {
@@ -3382,9 +3618,6 @@ function startReviewConsensusMeeting(
       const lang = resolveLang(taskDescription ?? taskTitle);
       const transcript: MeetingTranscriptEntry[] = [];
       const oneShotOptions = { projectPath, timeoutMs: 35_000 };
-      const wantsRevision = (content: string): boolean => (
-        /보완|수정|보류|리스크|추가.?필요|hold|revise|revision|required|pending|risk|block|保留|修正|补充|暂缓/i
-      ).test(content);
       meetingId = existingMeeting?.id ?? beginMeetingMinutes(taskId, "review", round, taskTitle);
       let minuteSeq = 1;
       if (meetingId) {
@@ -3473,7 +3706,7 @@ function startReviewConsensusMeeting(
         if (abortIfInactive()) return;
         const feedbackText = chooseSafeReply(feedbackRun, lang, "feedback", leader);
         speak(leader, "chat", "agent", planningLeader.id, feedbackText);
-        if (wantsRevision(feedbackText)) {
+        if (wantsReviewRevision(feedbackText)) {
           needsRevision = true;
           if (!reviseOwner) reviseOwner = leader;
         }
@@ -3543,12 +3776,22 @@ function startReviewConsensusMeeting(
         if (abortIfInactive()) return;
         const approvalText = chooseSafeReply(approvalRun, lang, "approval", leader);
         speak(leader, "status_update", "all", null, approvalText);
-        if (wantsRevision(approvalText)) {
+        if (wantsReviewRevision(approvalText)) {
           needsRevision = true;
           if (!reviseOwner) reviseOwner = leader;
         }
         await sleepMs(randomDelay(420, 860));
         if (abortIfInactive()) return;
+      }
+
+      // Final review result should follow each leader's last approval statement,
+      // not stale "needs revision" flags from earlier feedback turns.
+      const finalHoldLeaders = leaders.filter(
+        (leader) => meetingReviewDecisionByAgent.get(leader.id) === "hold"
+      );
+      needsRevision = finalHoldLeaders.length > 0;
+      if (needsRevision && !reviseOwner) {
+        reviseOwner = finalHoldLeaders[0] ?? null;
       }
 
       await sleepMs(randomDelay(540, 920));
@@ -3675,6 +3918,7 @@ function startTaskExecutionForAgent(
     project_path: string | null;
   } | undefined;
   if (!taskData) return;
+  notifyTaskStatus(taskId, taskData.title, "in_progress");
 
   const projPath = resolveProjectPath(taskData);
   const logFilePath = path.join(logsDir, `${taskId}.log`);
@@ -4029,6 +4273,7 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
 
     const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
     broadcast("task_update", updatedTask);
+    if (task) notifyTaskStatus(taskId, task.title, "review");
 
     // Notify: task entering review
     if (task) {
@@ -4227,6 +4472,7 @@ function finishReview(taskId: string, taskTitle: string): void {
 
     const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
     broadcast("task_update", updatedTask);
+    notifyTaskStatus(taskId, taskTitle, "done");
 
     refreshCliUsageData().then((usage) => broadcast("cli_usage_update", usage)).catch(() => {});
 
@@ -4278,6 +4524,55 @@ const buildHealthPayload = () => ({
 app.get("/health", (_req, res) => res.json(buildHealthPayload()));
 app.get("/healthz", (_req, res) => res.json(buildHealthPayload()));
 app.get("/api/health", (_req, res) => res.json(buildHealthPayload()));
+
+// ---------------------------------------------------------------------------
+// Gateway Channel Messaging
+// ---------------------------------------------------------------------------
+app.get("/api/gateway/targets", async (_req, res) => {
+  try {
+    const result = await gatewayHttpInvoke({
+      tool: "sessions_list", action: "json",
+      args: { limit: 100, activeMinutes: 60 * 24 * 7, messageLimit: 0 },
+    });
+    const sessions = Array.isArray(result?.details?.sessions) ? result.details.sessions : [];
+    const targets = sessions
+      .filter((s: any) => s?.deliveryContext?.channel && s?.deliveryContext?.to)
+      .map((s: any) => ({
+        sessionKey: s.key,
+        displayName: s.displayName || `${s.deliveryContext.channel}:${s.deliveryContext.to}`,
+        channel: s.deliveryContext.channel,
+        to: s.deliveryContext.to,
+      }));
+    res.json({ ok: true, targets });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+app.post("/api/gateway/send", async (req, res) => {
+  try {
+    const { sessionKey, text } = req.body ?? {};
+    if (!sessionKey || !text?.trim()) {
+      return res.status(400).json({ ok: false, error: "sessionKey and text required" });
+    }
+    const result = await gatewayHttpInvoke({
+      tool: "sessions_list", action: "json",
+      args: { limit: 200, activeMinutes: 60 * 24 * 30, messageLimit: 0 },
+    });
+    const sessions = Array.isArray(result?.details?.sessions) ? result.details.sessions : [];
+    const session = sessions.find((s: any) => s?.key === sessionKey);
+    if (!session?.deliveryContext?.channel || !session?.deliveryContext?.to) {
+      return res.status(404).json({ ok: false, error: "session not found or no delivery target" });
+    }
+    await gatewayHttpInvoke({
+      tool: "message", action: "send",
+      args: { channel: session.deliveryContext.channel, target: session.deliveryContext.to, message: text.trim() },
+    });
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Departments
@@ -4452,6 +4747,7 @@ app.post("/api/agents/:id/spawn", (req, res) => {
     const updatedAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(id);
     broadcast("agent_status", updatedAgent);
     broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+    notifyTaskStatus(taskId, task.title, "in_progress");
     launchHttpAgent(taskId, provider, prompt, projectPath, logPath, controller, fakePid);
     return res.json({ ok: true, pid: fakePid, logPath, cwd: projectPath });
   }
@@ -4470,6 +4766,7 @@ app.post("/api/agents/:id/spawn", (req, res) => {
   const updatedAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(id);
   broadcast("agent_status", updatedAgent);
   broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+  notifyTaskStatus(taskId, task.title, "in_progress");
 
   res.json({ ok: true, pid: child.pid ?? null, logPath, cwd: projectPath });
 });
@@ -5047,6 +5344,7 @@ app.post("/api/tasks/:id/run", (req, res) => {
     const updatedAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     broadcast("task_update", updatedTask);
     broadcast("agent_status", updatedAgent);
+    notifyTaskStatus(id, task.title, "in_progress");
 
     const worktreeNote = worktreePath ? ` (격리 브랜치: climpire/${id.slice(0, 8)})` : "";
     notifyCeo(`${agent.name_ko || agent.name}가 '${task.title}' 작업을 시작했습니다.${worktreeNote}`, id);
@@ -5078,6 +5376,7 @@ app.post("/api/tasks/:id/run", (req, res) => {
   const updatedAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
   broadcast("task_update", updatedTask);
   broadcast("agent_status", updatedAgent);
+  notifyTaskStatus(id, task.title, "in_progress");
 
   // B4: Notify CEO that task started
   const worktreeNote = worktreePath ? ` (격리 브랜치: climpire/${id.slice(0, 8)})` : "";
@@ -5727,6 +6026,171 @@ function scheduleAnnouncementReplies(announcement: string): void {
     }, replyDelay);
     delay += 1500 + Math.random() * 1500;
   }
+}
+
+type DirectivePolicy = {
+  skipDelegation: boolean;
+  skipDelegationReason: "no_task" | "lightweight" | null;
+  skipPlannedMeeting: boolean;
+  skipPlanSubtasks: boolean;
+};
+
+type DelegationOptions = {
+  skipPlannedMeeting?: boolean;
+  skipPlanSubtasks?: boolean;
+};
+
+function analyzeDirectivePolicy(content: string): DirectivePolicy {
+  const text = content.trim();
+  const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+  const compact = normalized.replace(/\s+/g, "");
+
+  const includesTerm = (term: string): boolean => {
+    const termNorm = term.toLowerCase();
+    return normalized.includes(termNorm) || compact.includes(termNorm.replace(/\s+/g, ""));
+  };
+  const includesAny = (terms: string[]): boolean => terms.some(includesTerm);
+
+  // Meeting skip is now controlled exclusively via API parameter (skipPlannedMeeting: true).
+  // Text-based keyword matching for "회의 없이" etc. has been removed for safety.
+  const isNoMeeting = false;
+
+  const isNoTask = includesAny([
+    "업무 생성 없이",
+    "태스크 생성 없이",
+    "작업 생성 없이",
+    "sub task 없이",
+    "delegation 없이",
+    "하달 없이",
+    "no task",
+    "no delegation",
+    "without delegation",
+    "do not delegate",
+    "don't delegate",
+    "タスク作成なし",
+    "タスク作成不要",
+    "委任なし",
+    "割り当てなし",
+    "下達なし",
+    "不创建任务",
+    "无需创建任务",
+    "不下达",
+    "不委派",
+    "不分配",
+  ]);
+
+  const hasLightweightSignal = includesAny([
+    "응답 테스트",
+    "응답테스트",
+    "테스트 중",
+    "테스트만",
+    "ping",
+    "헬스 체크",
+    "health check",
+    "status check",
+    "상태 확인",
+    "확인만",
+    "ack test",
+    "smoke test",
+    "応答テスト",
+    "応答確認",
+    "テストのみ",
+    "pingテスト",
+    "状態確認",
+    "動作確認",
+    "响应测试",
+    "响应确认",
+    "仅测试",
+    "测试一下",
+    "状态检查",
+    "健康检查",
+    "ping测试",
+  ]);
+
+  const hasWorkSignal = includesAny([
+    "업무",
+    "작업",
+    "하달",
+    "착수",
+    "실행",
+    "진행",
+    "작성",
+    "수정",
+    "구현",
+    "배포",
+    "리뷰",
+    "검토",
+    "정리",
+    "조치",
+    "할당",
+    "태스크",
+    "delegate",
+    "assign",
+    "implement",
+    "deploy",
+    "fix",
+    "review",
+    "plan",
+    "subtask",
+    "task",
+    "handoff",
+    "業務",
+    "作業",
+    "指示",
+    "実行",
+    "進行",
+    "作成",
+    "修正",
+    "実装",
+    "配布",
+    "レビュー",
+    "検討",
+    "整理",
+    "対応",
+    "割当",
+    "委任",
+    "計画",
+    "タスク",
+    "任务",
+    "工作",
+    "下达",
+    "执行",
+    "进行",
+    "编写",
+    "修改",
+    "实现",
+    "部署",
+    "评审",
+    "审核",
+    "处理",
+    "分配",
+    "委派",
+    "计划",
+    "子任务",
+  ]);
+
+  const isLightweight = hasLightweightSignal && !hasWorkSignal;
+  const skipDelegation = isNoTask || isLightweight;
+  const skipDelegationReason: DirectivePolicy["skipDelegationReason"] = isNoTask
+    ? "no_task"
+    : (isLightweight ? "lightweight" : null);
+  const skipPlannedMeeting = !skipDelegation && isNoMeeting;
+  const skipPlanSubtasks = skipPlannedMeeting;
+
+  return {
+    skipDelegation,
+    skipDelegationReason,
+    skipPlannedMeeting,
+    skipPlanSubtasks,
+  };
+}
+
+function shouldExecuteDirectiveDelegation(policy: DirectivePolicy, explicitSkipPlannedMeeting: boolean): boolean {
+  if (!policy.skipDelegation) return true;
+  // If the user explicitly selected "skip meeting", still execute delegation for
+  // lightweight/ping-like directives so the task is not silently dropped.
+  if (explicitSkipPlannedMeeting && policy.skipDelegationReason === "lightweight") return true;
+  return false;
 }
 
 // ---- Task delegation logic for team leaders ----
@@ -6878,11 +7342,14 @@ function handleTaskDelegation(
   teamLeader: AgentRow,
   ceoMessage: string,
   ceoMsgId: string,
+  options: DelegationOptions = {},
 ): void {
   const lang = resolveLang(ceoMessage);
   const leaderName = lang === "ko" ? (teamLeader.name_ko || teamLeader.name) : teamLeader.name;
   const leaderDeptId = teamLeader.department_id!;
   const leaderDeptName = getDeptName(leaderDeptId);
+  const skipPlannedMeeting = !!options.skipPlannedMeeting;
+  const skipPlanSubtasks = !!options.skipPlanSubtasks;
 
   // --- Step 1: Team leader acknowledges (1~2 sec) ---
   const ackDelay = 1000 + Math.random() * 1000;
@@ -6974,12 +7441,54 @@ function handleTaskDelegation(
       }, crossDelay);
     };
 
+    const runPlanningPhase = (afterPlan: () => void) => {
+      if (isTaskWorkflowInterrupted(taskId)) return;
+      if (skipPlannedMeeting) {
+        appendTaskLog(taskId, "system", "Planned meeting skipped by CEO directive");
+        if (!skipPlanSubtasks) {
+          seedApprovedPlanSubtasks(taskId, leaderDeptId, []);
+        }
+        runCrossDeptBeforeDelegationIfNeeded(afterPlan);
+        return;
+      }
+      startPlannedApprovalMeeting(taskId, taskTitle, leaderDeptId, (planningNotes) => {
+        if (isTaskWorkflowInterrupted(taskId)) return;
+        if (!skipPlanSubtasks) {
+          seedApprovedPlanSubtasks(taskId, leaderDeptId, planningNotes ?? []);
+        }
+        runCrossDeptBeforeDelegationIfNeeded(afterPlan);
+      });
+    };
+
     if (subordinate) {
       const subName = lang === "ko" ? (subordinate.name_ko || subordinate.name) : subordinate.name;
       const subRole = getRoleLabel(subordinate.role, lang);
 
       let ackMsg: string;
-      if (isPlanningLead && mentionedDepts.length > 0) {
+      if (skipPlannedMeeting && isPlanningLead && mentionedDepts.length > 0) {
+        const crossDeptNames = mentionedDepts.map(getDeptName).join(", ");
+        ackMsg = pickL(l(
+          [`네, 대표님! 팀장 계획 회의는 생략하고 ${crossDeptNames} 유관부서 사전 조율 후 ${subRole} ${subName}에게 즉시 하달하겠습니다. 📋`],
+          [`Understood. We'll skip the leaders' planning meeting, coordinate quickly with ${crossDeptNames}, then delegate immediately to ${subRole} ${subName}. 📋`],
+          [`了解しました。リーダー計画会議は省略し、${crossDeptNames} と事前調整後に ${subRole} ${subName} へ即時委任します。📋`],
+          [`收到。将跳过负责人规划会议，先与${crossDeptNames}快速协同后立即下达给${subRole} ${subName}。📋`],
+        ), lang);
+      } else if (skipPlannedMeeting && mentionedDepts.length > 0) {
+        const crossDeptNames = mentionedDepts.map(getDeptName).join(", ");
+        ackMsg = pickL(l(
+          [`네, 대표님! 팀장 계획 회의 없이 바로 ${subRole} ${subName}에게 하달하고 ${crossDeptNames} 협업을 병행하겠습니다. 📋`],
+          [`Understood. We'll skip the planning meeting, delegate directly to ${subRole} ${subName}, and coordinate with ${crossDeptNames} in parallel. 📋`],
+          [`了解しました。計画会議なしで ${subRole} ${subName} へ直ちに委任し、${crossDeptNames} との協業を並行します。📋`],
+          [`收到。跳过规划会议，直接下达给${subRole} ${subName}，并并行推进${crossDeptNames}协作。📋`],
+        ), lang);
+      } else if (skipPlannedMeeting) {
+        ackMsg = pickL(l(
+          [`네, 대표님! 팀장 계획 회의는 생략하고 ${subRole} ${subName}에게 즉시 하달하겠습니다. 📋`],
+          [`Understood. We'll skip the leaders' planning meeting and delegate immediately to ${subRole} ${subName}. 📋`],
+          [`了解しました。リーダー計画会議は省略し、${subRole} ${subName} へ即時委任します。📋`],
+          [`收到。将跳过负责人规划会议，立即下达给${subRole} ${subName}。📋`],
+        ), lang);
+      } else if (isPlanningLead && mentionedDepts.length > 0) {
         const crossDeptNames = mentionedDepts.map(getDeptName).join(", ");
         ackMsg = pickL(l(
           [`네, 대표님! 먼저 ${crossDeptNames} 유관부서 목록을 확정하고 회의/선행 협업을 완료한 뒤 ${subRole} ${subName}에게 하달하겠습니다. 📋`, `알겠습니다! 기획팀에서 유관부서 선처리까지 마친 뒤 ${subName}에게 최종 하달하겠습니다.`],
@@ -7005,7 +7514,7 @@ function handleTaskDelegation(
       }
       sendAgentMessage(teamLeader, ackMsg, "chat", "agent", null, taskId);
 
-      const delegateToSubordinate = () => {
+	      const delegateToSubordinate = () => {
         // --- Step 2: Delegate to subordinate (2~3 sec) ---
         const delegateDelay = 2000 + Math.random() * 1000;
         setTimeout(() => {
@@ -7043,22 +7552,25 @@ function handleTaskDelegation(
             startTaskExecutionForAgent(taskId, subordinate, leaderDeptId, leaderDeptName);
             runCrossDeptAfterMainIfNeeded();
           }, subAckDelay);
-        }, delegateDelay);
-      };
+	        }, delegateDelay);
+	      };
 
-      startPlannedApprovalMeeting(taskId, taskTitle, leaderDeptId, (planningNotes) => {
-        if (isTaskWorkflowInterrupted(taskId)) return;
-        seedApprovedPlanSubtasks(taskId, leaderDeptId, planningNotes ?? []);
-        runCrossDeptBeforeDelegationIfNeeded(delegateToSubordinate);
-      });
+	      runPlanningPhase(delegateToSubordinate);
     } else {
       // No subordinate — team leader handles it themselves
-      const selfMsg = pickL(l(
-        [`네, 대표님! 먼저 팀장 계획 회의를 진행하고, 팀 내 가용 인력이 없어 회의 정리 후 제가 직접 처리하겠습니다. 💪`, `알겠습니다! 팀장 계획 회의 완료 후 제가 직접 진행하겠습니다.`],
-        [`Understood. We'll complete the team-lead planning meeting first, and since no one is available I'll execute it myself after the plan is organized. 💪`, `Got it. I'll proceed personally after the leaders' planning meeting.`],
-        [`了解しました。まずチームリーダー計画会議を行い、空き要員がいないため会議整理後は私が直接対応します。💪`],
-        [`收到。先进行团队负责人规划会议，因无可用成员，会议整理后由我亲自执行。💪`],
-      ), lang);
+      const selfMsg = skipPlannedMeeting
+        ? pickL(l(
+          [`네, 대표님! 팀장 계획 회의는 생략하고 팀 내 가용 인력이 없어 제가 즉시 직접 처리하겠습니다. 💪`],
+          [`Understood. We'll skip the leaders' planning meeting and I'll execute this directly right away since no assignee is available. 💪`],
+          [`了解しました。リーダー計画会議は省略し、空き要員がいないため私が即時対応します。💪`],
+          [`收到。将跳过负责人规划会议，因无可用成员由我立即亲自处理。💪`],
+        ), lang)
+        : pickL(l(
+          [`네, 대표님! 먼저 팀장 계획 회의를 진행하고, 팀 내 가용 인력이 없어 회의 정리 후 제가 직접 처리하겠습니다. 💪`, `알겠습니다! 팀장 계획 회의 완료 후 제가 직접 진행하겠습니다.`],
+          [`Understood. We'll complete the team-lead planning meeting first, and since no one is available I'll execute it myself after the plan is organized. 💪`, `Got it. I'll proceed personally after the leaders' planning meeting.`],
+          [`了解しました。まずチームリーダー計画会議を行い、空き要員がいないため会議整理後は私が直接対応します。💪`],
+          [`收到。先进行团队负责人规划会议，因无可用成员，会议整理后由我亲自执行。💪`],
+        ), lang);
       sendAgentMessage(teamLeader, selfMsg, "chat", "agent", null, taskId);
 
       const t2 = nowMs();
@@ -7071,14 +7583,10 @@ function handleTaskDelegation(
       broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
       broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(teamLeader.id));
 
-      startPlannedApprovalMeeting(taskId, taskTitle, leaderDeptId, (planningNotes) => {
+      runPlanningPhase(() => {
         if (isTaskWorkflowInterrupted(taskId)) return;
-        seedApprovedPlanSubtasks(taskId, leaderDeptId, planningNotes ?? []);
-        runCrossDeptBeforeDelegationIfNeeded(() => {
-          if (isTaskWorkflowInterrupted(taskId)) return;
-          startTaskExecutionForAgent(taskId, teamLeader, leaderDeptId, leaderDeptName);
-          runCrossDeptAfterMainIfNeeded();
-        });
+        startTaskExecutionForAgent(taskId, teamLeader, leaderDeptId, leaderDeptName);
+        runCrossDeptAfterMainIfNeeded();
       });
     }
   }, ackDelay);
@@ -7342,43 +7850,52 @@ app.post("/api/directives", (req, res) => {
 
   // 3. Team leaders respond
   scheduleAnnouncementReplies(content);
+  const directivePolicy = analyzeDirectivePolicy(content);
+  const explicitSkip = body.skipPlannedMeeting === true;
+  const shouldDelegate = shouldExecuteDirectiveDelegation(directivePolicy, explicitSkip);
+  const delegationOptions: DelegationOptions = {
+    skipPlannedMeeting: explicitSkip || directivePolicy.skipPlannedMeeting,
+    skipPlanSubtasks: explicitSkip || directivePolicy.skipPlanSubtasks,
+  };
 
-  // 4. Auto-delegate to planning team leader
-  const planningLeader = findTeamLeader("planning");
-  if (planningLeader) {
-    const delegationDelay = 3000 + Math.random() * 2000;
-    setTimeout(() => {
-      handleTaskDelegation(planningLeader, content, "");
-    }, delegationDelay);
-  }
+  if (shouldDelegate) {
+    // 4. Auto-delegate to planning team leader
+    const planningLeader = findTeamLeader("planning");
+    if (planningLeader) {
+      const delegationDelay = 3000 + Math.random() * 2000;
+      setTimeout(() => {
+        handleTaskDelegation(planningLeader, content, "", delegationOptions);
+      }, delegationDelay);
+    }
 
-  // 5. Additional @mentions trigger delegation to other departments
-  const mentions = detectMentions(content);
-  if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
-    const mentionDelay = 5000 + Math.random() * 2000;
-    setTimeout(() => {
-      const processedDepts = new Set<string>(["planning"]);
+    // 5. Additional @mentions trigger delegation to other departments
+    const mentions = detectMentions(content);
+    if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
+      const mentionDelay = 5000 + Math.random() * 2000;
+      setTimeout(() => {
+        const processedDepts = new Set<string>(["planning"]);
 
-      for (const deptId of mentions.deptIds) {
-        if (processedDepts.has(deptId)) continue;
-        processedDepts.add(deptId);
-        const leader = findTeamLeader(deptId);
-        if (leader) {
-          handleTaskDelegation(leader, content, "");
-        }
-      }
-
-      for (const agentId of mentions.agentIds) {
-        const mentioned = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
-        if (mentioned?.department_id && !processedDepts.has(mentioned.department_id)) {
-          processedDepts.add(mentioned.department_id);
-          const leader = findTeamLeader(mentioned.department_id);
+        for (const deptId of mentions.deptIds) {
+          if (processedDepts.has(deptId)) continue;
+          processedDepts.add(deptId);
+          const leader = findTeamLeader(deptId);
           if (leader) {
-            handleTaskDelegation(leader, content, "");
+            handleTaskDelegation(leader, content, "", delegationOptions);
           }
         }
-      }
-    }, mentionDelay);
+
+        for (const agentId of mentions.agentIds) {
+          const mentioned = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+          if (mentioned?.department_id && !processedDepts.has(mentioned.department_id)) {
+            processedDepts.add(mentioned.department_id);
+            const leader = findTeamLeader(mentioned.department_id);
+            if (leader) {
+              handleTaskDelegation(leader, content, "", delegationOptions);
+            }
+          }
+        }
+      }, mentionDelay);
+    }
   }
 
   res.json({ ok: true, message: msg });
@@ -7425,21 +7942,31 @@ app.post("/api/inbox", (req, res) => {
 
   // Team leaders respond
   scheduleAnnouncementReplies(content);
+  const directivePolicy = isDirective ? analyzeDirectivePolicy(content) : null;
+  const inboxExplicitSkip = body.skipPlannedMeeting === true;
+  const shouldDelegateDirective = isDirective && directivePolicy
+    ? shouldExecuteDirectiveDelegation(directivePolicy, inboxExplicitSkip)
+    : false;
+  const directiveDelegationOptions: DelegationOptions = {
+    skipPlannedMeeting: inboxExplicitSkip || !!directivePolicy?.skipPlannedMeeting,
+    skipPlanSubtasks: inboxExplicitSkip || !!directivePolicy?.skipPlanSubtasks,
+  };
 
-  if (isDirective) {
+  if (shouldDelegateDirective) {
     // Auto-delegate to planning team leader
     const planningLeader = findTeamLeader("planning");
     if (planningLeader) {
       const delegationDelay = 3000 + Math.random() * 2000;
       setTimeout(() => {
-        handleTaskDelegation(planningLeader, content, "");
+        handleTaskDelegation(planningLeader, content, "", directiveDelegationOptions);
       }, delegationDelay);
     }
   }
 
   // Handle @mentions
   const mentions = detectMentions(content);
-  if (mentions.deptIds.length > 0 || mentions.agentIds.length > 0) {
+  const shouldHandleMentions = !isDirective || shouldDelegateDirective;
+  if (shouldHandleMentions && (mentions.deptIds.length > 0 || mentions.agentIds.length > 0)) {
     const mentionDelay = 5000 + Math.random() * 2000;
     setTimeout(() => {
       const processedDepts = new Set<string>(isDirective ? ["planning"] : []);
@@ -7449,7 +7976,12 @@ app.post("/api/inbox", (req, res) => {
         processedDepts.add(deptId);
         const leader = findTeamLeader(deptId);
         if (leader) {
-          handleTaskDelegation(leader, content, "");
+          handleTaskDelegation(
+            leader,
+            content,
+            "",
+            isDirective ? directiveDelegationOptions : {},
+          );
         }
       }
 
@@ -7459,7 +7991,12 @@ app.post("/api/inbox", (req, res) => {
           processedDepts.add(mentioned.department_id);
           const leader = findTeamLeader(mentioned.department_id);
           if (leader) {
-            handleTaskDelegation(leader, content, "");
+            handleTaskDelegation(
+              leader,
+              content,
+              "",
+              isDirective ? directiveDelegationOptions : {},
+            );
           }
         }
       }
@@ -9024,6 +9561,7 @@ function recoverInterruptedWorkflowOnStartup(): void {
 
     const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id);
     broadcast("task_update", updatedTask);
+    notifyTaskStatus(task.id, task.title, "review");
   }
 
   const reviewTasks = db.prepare(`
@@ -9043,10 +9581,54 @@ function recoverInterruptedWorkflowOnStartup(): void {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Auto-assign agent providers on startup
+// ---------------------------------------------------------------------------
+async function autoAssignAgentProviders(): Promise<void> {
+  const autoAssignRow = db.prepare(
+    "SELECT value FROM settings WHERE key = 'autoAssign'"
+  ).get() as { value: string } | undefined;
+  if (!autoAssignRow || autoAssignRow.value === "false") return;
+
+  const cliStatus = await detectAllCli();
+  const authenticated = Object.entries(cliStatus)
+    .filter(([, s]) => s.installed && s.authenticated)
+    .map(([name]) => name);
+
+  if (authenticated.length === 0) {
+    console.log("[Claw-Empire] Auto-assign skipped: no authenticated CLI providers");
+    return;
+  }
+
+  const dpRow = db.prepare(
+    "SELECT value FROM settings WHERE key = 'defaultProvider'"
+  ).get() as { value: string } | undefined;
+  const defaultProv = dpRow?.value?.replace(/"/g, "") || "claude";
+  const fallback = authenticated.includes(defaultProv) ? defaultProv : authenticated[0];
+
+  const agents = db.prepare("SELECT id, name, cli_provider FROM agents").all() as Array<{
+    id: string; name: string; cli_provider: string | null;
+  }>;
+
+  let count = 0;
+  for (const agent of agents) {
+    const prov = agent.cli_provider || "";
+    if (prov === "copilot" || prov === "antigravity") continue;
+    if (authenticated.includes(prov)) continue;
+
+    db.prepare("UPDATE agents SET cli_provider = ? WHERE id = ?").run(fallback, agent.id);
+    broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(agent.id));
+    console.log(`[Claw-Empire] Auto-assigned ${agent.name}: ${prov || "none"} → ${fallback}`);
+    count++;
+  }
+  if (count > 0) console.log(`[Claw-Empire] Auto-assigned ${count} agent(s)`);
+}
+
 // Run rotation every 60 seconds, and once on startup after 5s
 setTimeout(rotateBreaks, 5_000);
 setInterval(rotateBreaks, 60_000);
 setTimeout(recoverInterruptedWorkflowOnStartup, 3_000);
+setTimeout(autoAssignAgentProviders, 4_000);
 
 // ---------------------------------------------------------------------------
 // Start HTTP server + WebSocket

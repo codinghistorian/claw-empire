@@ -65,7 +65,7 @@ Copy `.env.example` to `.env`. All secrets stay local -- never commit `.env`.
 | `OAUTH_ENCRYPTION_SECRET` | **Yes** | Encrypts OAuth tokens stored in SQLite. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `PORT` | No | Server port (default: `8787`) |
 | `HOST` | No | Bind address (default: `127.0.0.1`) |
-| `DB_PATH` | No | SQLite database path (default: `./climpire.sqlite`) |
+| `DB_PATH` | No | SQLite database path (default: `./claw-empire.sqlite`) |
 | `LOGS_DIR` | No | Log directory (default: `./logs`) |
 | `OAUTH_BASE_URL` | No | Callback base URL override |
 | `OAUTH_GITHUB_CLIENT_ID` | No | GitHub OAuth App client ID |

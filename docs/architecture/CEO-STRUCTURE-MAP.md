@@ -28,7 +28,7 @@ flowchart LR
     BE0["server/index.ts"]
     BE1["Express REST (/api/*)"]
     BE2["WebSocket broadcast"]
-    BE3["SQLite (climpire.sqlite)"]
+    BE3["SQLite (claw-empire.sqlite)"]
     BE4["CLI/HTTP agents + logs + worktrees"]
     BE0 --> BE1
     BE0 --> BE2

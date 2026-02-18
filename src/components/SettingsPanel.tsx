@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { CompanySettings, CliStatusMap, CliProvider, CliModelInfo } from "../types";
 import * as api from "../api";
-import type { OAuthStatus, OAuthConnectProvider, DeviceCodeStart } from "../api";
+import type { OAuthStatus, OAuthConnectProvider, DeviceCodeStart, GatewayTarget } from "../api";
 import type { OAuthCallbackResult } from "../App";
 
 interface SettingsPanelProps {
@@ -160,7 +160,7 @@ export default function SettingsPanel({
   const [form, setForm] = useState<LocalSettings>(settings as LocalSettings);
   const { t, localeTag } = useI18n(form.language);
   const [saved, setSaved] = useState(false);
-  const [tab, setTab] = useState<"general" | "cli" | "oauth">(
+  const [tab, setTab] = useState<"general" | "cli" | "oauth" | "gateway">(
     oauthResult ? "oauth" : "general"
   );
   const [oauthStatus, setOauthStatus] = useState<OAuthStatus | null>(null);
@@ -181,6 +181,16 @@ export default function SettingsPanel({
   const [deviceStatus, setDeviceStatus] = useState<string | null>(null); // "polling" | "complete" | "error" | "expired"
   const [deviceError, setDeviceError] = useState<string | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Gateway channel messaging state
+  const [gwTargets, setGwTargets] = useState<GatewayTarget[]>([]);
+  const [gwLoading, setGwLoading] = useState(false);
+  const [gwSelected, setGwSelected] = useState<string>(
+    () => (typeof window !== "undefined" ? localStorage.getItem("climpire.gateway.lastTarget") ?? "" : "")
+  );
+  const [gwText, setGwText] = useState("");
+  const [gwSending, setGwSending] = useState(false);
+  const [gwStatus, setGwStatus] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const persistSettings = useCallback(
     (next: LocalSettings) => {
@@ -250,6 +260,46 @@ export default function SettingsPanel({
       if (pollTimerRef.current) clearInterval(pollTimerRef.current);
     };
   }, []);
+
+  // Load gateway targets when tab is visible
+  const loadGwTargets = useCallback(() => {
+    setGwLoading(true);
+    setGwStatus(null);
+    api.getGatewayTargets()
+      .then((targets) => {
+        setGwTargets(targets);
+        if (targets.length > 0 && !targets.find((t) => t.sessionKey === gwSelected)) {
+          const fallback = targets[0].sessionKey;
+          setGwSelected(fallback);
+          localStorage.setItem("climpire.gateway.lastTarget", fallback);
+        }
+      })
+      .catch((err) => setGwStatus({ ok: false, msg: String(err) }))
+      .finally(() => setGwLoading(false));
+  }, [gwSelected]);
+
+  useEffect(() => {
+    if (tab === "gateway" && gwTargets.length === 0 && !gwLoading) loadGwTargets();
+  }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleGwSend = useCallback(async () => {
+    if (!gwSelected || !gwText.trim()) return;
+    setGwSending(true);
+    setGwStatus(null);
+    try {
+      const res = await api.sendGatewayMessage(gwSelected, gwText.trim());
+      if (res.ok) {
+        setGwStatus({ ok: true, msg: t({ ko: "전송 완료!", en: "Sent!", ja: "送信完了!", zh: "发送成功!" }) });
+        setGwText("");
+      } else {
+        setGwStatus({ ok: false, msg: res.error || "Send failed" });
+      }
+    } catch (err) {
+      setGwStatus({ ok: false, msg: String(err) });
+    } finally {
+      setGwSending(false);
+    }
+  }, [gwSelected, gwText, t]);
 
   function handleSave() {
     const nextLocale = normalizeLocale(form.language) ?? "en";
@@ -377,6 +427,11 @@ export default function SettingsPanel({
             key: "oauth",
             label: t({ ko: "OAuth 인증", en: "OAuth", ja: "OAuth 認証", zh: "OAuth 认证" }),
             icon: "🔑",
+          },
+          {
+            key: "gateway",
+            label: t({ ko: "채널 메시지", en: "Channel", ja: "チャネル", zh: "频道" }),
+            icon: "📡",
           },
         ].map((t) => (
           <button
@@ -588,10 +643,10 @@ export default function SettingsPanel({
 
                   {/* Model selection — only for installed+authenticated CLI providers */}
                   {isReady && (
-                    <div className="pl-8 space-y-1.5">
+                    <div className="space-y-1.5 pl-0 sm:pl-8">
                       {/* Main model */}
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs text-slate-400 shrink-0 w-20">
+                      <div className="flex min-w-0 flex-col items-stretch gap-1.5 sm:flex-row sm:items-center sm:gap-2">
+                        <span className="w-auto shrink-0 text-xs text-slate-400 sm:w-20">
                           {hasSubModel
                             ? t({ ko: "메인 모델:", en: "Main model:", ja: "メインモデル:", zh: "主模型:" })
                             : t({ ko: "모델:", en: "Model:", ja: "モデル:", zh: "模型:" })}
@@ -619,7 +674,7 @@ export default function SettingsPanel({
                               setForm(newForm);
                               persistSettings(newForm);
                             }}
-                            className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
+                            className="w-full min-w-0 rounded border border-slate-600 bg-slate-700/50 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none sm:flex-1"
                           >
                             <option value="">{t({ ko: "기본값", en: "Default", ja: "デフォルト", zh: "默认" })}</option>
                             {modelList.map((m) => (
@@ -637,8 +692,8 @@ export default function SettingsPanel({
 
                       {/* Reasoning level dropdown — Codex only */}
                       {provider === "codex" && reasoningLevels && reasoningLevels.length > 0 && (
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-slate-400 shrink-0 w-20">
+                        <div className="flex min-w-0 flex-col items-stretch gap-1.5 sm:flex-row sm:items-center sm:gap-2">
+                          <span className="w-auto shrink-0 text-xs text-slate-400 sm:w-20">
                             {t({ ko: "추론 레벨:", en: "Reasoning:", ja: "推論レベル:", zh: "推理级别:" })}
                           </span>
                           <select
@@ -653,7 +708,7 @@ export default function SettingsPanel({
                               setForm(newForm);
                               persistSettings(newForm);
                             }}
-                            className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
+                            className="w-full min-w-0 rounded border border-slate-600 bg-slate-700/50 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none sm:flex-1"
                           >
                             {reasoningLevels.map((rl) => (
                               <option key={rl.effort} value={rl.effort}>
@@ -667,8 +722,8 @@ export default function SettingsPanel({
                       {/* Sub-agent model — claude/codex only */}
                       {hasSubModel && (
                         <>
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs text-slate-400 shrink-0 w-20">
+                          <div className="flex min-w-0 flex-col items-stretch gap-1.5 sm:flex-row sm:items-center sm:gap-2">
+                            <span className="w-auto shrink-0 text-xs text-slate-400 sm:w-20">
                               {t({ ko: "알바생 모델:", en: "Sub-agent model:", ja: "サブモデル:", zh: "子代理模型:" })}
                             </span>
                             {cliModelsLoading ? (
@@ -694,7 +749,7 @@ export default function SettingsPanel({
                                   setForm(newForm);
                                   persistSettings(newForm);
                                 }}
-                                className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
+                                className="w-full min-w-0 rounded border border-slate-600 bg-slate-700/50 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none sm:flex-1"
                               >
                                 <option value="">{t({ ko: "기본값", en: "Default", ja: "デフォルト", zh: "默认" })}</option>
                                 {modelList.map((m) => (
@@ -718,8 +773,8 @@ export default function SettingsPanel({
                             const currentSubRL = form.providerModelConfig?.[provider]?.subModelReasoningLevel || "";
                             if (provider !== "codex" || !subLevels || subLevels.length === 0) return null;
                             return (
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs text-slate-400 shrink-0 w-20">
+                              <div className="flex min-w-0 flex-col items-stretch gap-1.5 sm:flex-row sm:items-center sm:gap-2">
+                                <span className="w-auto shrink-0 text-xs text-slate-400 sm:w-20">
                                   {t({ ko: "알바 추론:", en: "Sub reasoning:", ja: "サブ推論:", zh: "子推理:" })}
                                 </span>
                                 <select
@@ -734,7 +789,7 @@ export default function SettingsPanel({
                                     setForm(newForm);
                                     persistSettings(newForm);
                                   }}
-                                  className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
+                                  className="w-full min-w-0 rounded border border-slate-600 bg-slate-700/50 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none sm:flex-1"
                                 >
                                   {subLevels.map((rl) => (
                                     <option key={rl.effort} value={rl.effort}>
@@ -865,15 +920,15 @@ export default function SettingsPanel({
                     const isWebOAuth = info.source === "web-oauth";
                     const isFileDetected = info.source === "file-detected";
                     return (
-                      <div key={provider} className="bg-slate-700/30 rounded-lg p-4 space-y-2">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2.5">
+                      <div key={provider} className="space-y-2 overflow-hidden rounded-lg bg-slate-700/30 p-4">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
                             {LogoComp ? <LogoComp className="w-5 h-5" /> : <span className="text-lg">🔑</span>}
                             <span className="text-sm font-medium text-white">
                               {oauthInfo?.label ?? provider}
                             </span>
                             {info.email && (
-                              <span className="text-xs text-slate-400">{info.email}</span>
+                              <span className="max-w-full break-all text-xs text-slate-400">{info.email}</span>
                             )}
                             {isFileDetected && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/50 text-slate-400">
@@ -886,7 +941,7 @@ export default function SettingsPanel({
                               </span>
                             )}
                           </div>
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                             {/* Status badge */}
                             {!isExpired ? (
                               <span className="text-xs px-2 py-0.5 rounded-full bg-green-500/20 text-green-400">
@@ -959,7 +1014,7 @@ export default function SettingsPanel({
                                 <span className="text-slate-500">
                                   {t({ ko: "스코프", en: "Scope", ja: "スコープ", zh: "范围" })}:{" "}
                                 </span>
-                                <span className="text-slate-300 font-mono text-[10px]">{info.scope}</span>
+                                <span className="break-all font-mono text-[10px] leading-relaxed text-slate-300">{info.scope}</span>
                               </div>
                             )}
                             {expiresAt && (
@@ -991,8 +1046,8 @@ export default function SettingsPanel({
                           const modelList = models?.[modelKey];
                           const currentModel = form.providerModelConfig?.[modelKey]?.model || "";
                           return (
-                            <div className="flex items-center gap-2 pt-1">
-                              <span className="text-xs text-slate-400 shrink-0">
+                            <div className="flex min-w-0 flex-col items-stretch gap-1.5 pt-1 sm:flex-row sm:items-center sm:gap-2">
+                              <span className="w-auto shrink-0 text-xs text-slate-400">
                                 {t({ ko: "모델:", en: "Model:", ja: "モデル:", zh: "模型:" })}
                               </span>
                               {modelsLoading ? (
@@ -1008,7 +1063,7 @@ export default function SettingsPanel({
                                     setForm(newForm);
                                     persistSettings(newForm);
                                   }}
-                                  className="flex-1 px-2 py-1 bg-slate-700/50 border border-slate-600 rounded text-white text-xs focus:outline-none focus:border-blue-500"
+                                  className="w-full min-w-0 rounded border border-slate-600 bg-slate-700/50 px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none sm:flex-1"
                                 >
                                   {!currentModel && (
                                     <option value="">
@@ -1114,6 +1169,107 @@ export default function SettingsPanel({
             </div>
           </>
         ) : null}
+      </section>
+      )}
+
+      {/* Gateway Channel Messaging Tab */}
+      {tab === "gateway" && (
+      <section className="space-y-4 rounded-xl border border-slate-700/50 bg-slate-800/60 p-4 sm:p-5">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
+            {t({ ko: "채널 메시지 전송", en: "Channel Messaging", ja: "チャネルメッセージ", zh: "频道消息" })}
+          </h3>
+          <button
+            onClick={loadGwTargets}
+            disabled={gwLoading}
+            className="text-xs text-blue-400 hover:text-blue-300 transition-colors disabled:opacity-50"
+          >
+            🔄 {t({ ko: "새로고침", en: "Refresh", ja: "更新", zh: "刷新" })}
+          </button>
+        </div>
+
+        {/* Channel selector */}
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">
+            {t({ ko: "대상 채널", en: "Target Channel", ja: "対象チャネル", zh: "目标频道" })}
+          </label>
+          {gwLoading ? (
+            <div className="text-xs text-slate-500 animate-pulse py-2">
+              {t({ ko: "채널 목록 로딩 중...", en: "Loading channels...", ja: "チャネル読み込み中...", zh: "正在加载频道..." })}
+            </div>
+          ) : gwTargets.length === 0 ? (
+            <div className="text-xs text-slate-500 py-2">
+              {t({
+                ko: "채널이 없습니다. Gateway가 실행 중인지 확인하세요.",
+                en: "No channels found. Make sure Gateway is running.",
+                ja: "チャネルがありません。ゲートウェイが実行中か確認してください。",
+                zh: "未找到频道。请确认网关正在运行。",
+              })}
+            </div>
+          ) : (
+            <select
+              value={gwSelected}
+              onChange={(e) => {
+                setGwSelected(e.target.value);
+                localStorage.setItem("climpire.gateway.lastTarget", e.target.value);
+              }}
+              className="w-full px-3 py-2 bg-slate-700/50 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+            >
+              {gwTargets.map((tgt) => (
+                <option key={tgt.sessionKey} value={tgt.sessionKey}>
+                  {tgt.displayName} ({tgt.channel})
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        {/* Message input */}
+        <div>
+          <label className="block text-xs text-slate-400 mb-1">
+            {t({ ko: "메시지", en: "Message", ja: "メッセージ", zh: "消息" })}
+          </label>
+          <textarea
+            value={gwText}
+            onChange={(e) => setGwText(e.target.value)}
+            placeholder={t({ ko: "메시지를 입력하세요...", en: "Type a message...", ja: "メッセージを入力...", zh: "输入消息..." })}
+            rows={3}
+            className="w-full px-3 py-2 bg-slate-700/50 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:border-blue-500 resize-y"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                handleGwSend();
+              }
+            }}
+          />
+        </div>
+
+        {/* Send button + status */}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleGwSend}
+            disabled={gwSending || !gwSelected || !gwText.trim()}
+            className="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {gwSending
+              ? t({ ko: "전송 중...", en: "Sending...", ja: "送信中...", zh: "发送中..." })
+              : t({ ko: "전송", en: "Send", ja: "送信", zh: "发送" })}
+          </button>
+          <span className="text-xs text-slate-500">
+            {t({ ko: "Ctrl+Enter로 전송", en: "Ctrl+Enter to send", ja: "Ctrl+Enterで送信", zh: "Ctrl+Enter 发送" })}
+          </span>
+        </div>
+
+        {/* Status feedback */}
+        {gwStatus && (
+          <div className={`text-xs px-3 py-2 rounded-lg ${
+            gwStatus.ok
+              ? "bg-green-500/10 text-green-400 border border-green-500/20"
+              : "bg-red-500/10 text-red-400 border border-red-500/20"
+          }`}>
+            {gwStatus.msg}
+          </div>
+        )}
       </section>
       )}
     </div>

@@ -4489,7 +4489,7 @@ function startTaskExecutionForAgent(
   broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(execAgent.id));
 
   const provider = execAgent.cli_provider || "claude";
-  if (!["claude", "codex", "gemini", "opencode"].includes(provider)) return;
+  if (!["claude", "codex", "gemini", "opencode", "copilot", "antigravity"].includes(provider)) return;
 
   const taskData = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as {
     title: string;
@@ -4516,13 +4516,28 @@ function startTaskExecutionForAgent(
   ].filter(Boolean).join("\n");
 
   appendTaskLog(taskId, "system", `RUN start (agent=${execAgent.name}, provider=${provider})`);
-  const modelConfig = getProviderModelConfig();
-  const modelForProvider = modelConfig[provider]?.model || undefined;
-  const reasoningLevel = modelConfig[provider]?.reasoningLevel || undefined;
-  const child = spawnCliAgent(taskId, provider, spawnPrompt, projPath, logFilePath, modelForProvider, reasoningLevel);
-  child.on("close", (code) => {
-    handleTaskRunComplete(taskId, code ?? 1);
-  });
+  if (provider === "copilot" || provider === "antigravity") {
+    const controller = new AbortController();
+    const fakePid = -(++httpAgentCounter);
+    launchHttpAgent(
+      taskId,
+      provider,
+      spawnPrompt,
+      projPath,
+      logFilePath,
+      controller,
+      fakePid,
+      execAgent.oauth_account_id ?? null,
+    );
+  } else {
+    const modelConfig = getProviderModelConfig();
+    const modelForProvider = modelConfig[provider]?.model || undefined;
+    const reasoningLevel = modelConfig[provider]?.reasoningLevel || undefined;
+    const child = spawnCliAgent(taskId, provider, spawnPrompt, projPath, logFilePath, modelForProvider, reasoningLevel);
+    child.on("close", (code) => {
+      handleTaskRunComplete(taskId, code ?? 1);
+    });
+  }
 
   const lang = resolveLang(taskData.description ?? taskData.title);
   notifyCeo(pickL(l(
@@ -8291,21 +8306,88 @@ function handleTaskDelegation(
   }, ackDelay);
 }
 
-// ---- Non-team-leader agents: simple chat reply ----
+// ---- Direct 1:1 chat/task handling ----
+
+function shouldTreatDirectChatAsTask(ceoMessage: string, messageType: string): boolean {
+  if (messageType === "task_assign") return true;
+  if (messageType === "report") return false;
+  const text = ceoMessage.trim();
+  if (!text) return false;
+
+  if (/^\s*(task|todo|업무|지시|작업|할일)\s*[:\-]/i.test(text)) return true;
+
+  const taskKeywords = /(테스트|검증|확인해|진행해|수정해|구현해|반영해|처리해|해줘|부탁|fix|implement|refactor|test|verify|check|run|apply|update|debug|investigate|対応|確認|修正|実装|测试|检查|修复|处理)/i;
+  if (taskKeywords.test(text)) return true;
+
+  const requestTone = /(해주세요|해 주세요|부탁해|부탁합니다|please|can you|could you|お願いします|してください|请|麻烦)/i;
+  if (requestTone.test(text) && text.length >= 12) return true;
+
+  return false;
+}
+
+function createDirectAgentTaskAndRun(agent: AgentRow, ceoMessage: string): void {
+  const lang = resolveLang(ceoMessage);
+  const taskId = randomUUID();
+  const t = nowMs();
+  const taskTitle = ceoMessage.length > 60 ? ceoMessage.slice(0, 57) + "..." : ceoMessage;
+  const detectedPath = detectProjectPath(ceoMessage);
+  const deptId = agent.department_id ?? null;
+  const deptName = deptId ? getDeptName(deptId) : "Unassigned";
+
+  db.prepare(`
+    INSERT INTO tasks (id, title, description, department_id, assigned_agent_id, status, priority, task_type, project_path, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'planned', 1, 'general', ?, ?, ?)
+  `).run(
+    taskId,
+    taskTitle,
+    `[CEO DIRECT] ${ceoMessage}`,
+    deptId,
+    agent.id,
+    detectedPath,
+    t,
+    t,
+  );
+
+  db.prepare("UPDATE agents SET current_task_id = ? WHERE id = ?").run(taskId, agent.id);
+  appendTaskLog(taskId, "system", `Direct CEO assignment to ${agent.name}: ${ceoMessage}`);
+  if (detectedPath) {
+    appendTaskLog(taskId, "system", `Project path detected from direct chat: ${detectedPath}`);
+  }
+
+  const ack = pickL(l(
+    ["지시 확인했습니다. 바로 작업으로 등록하고 착수하겠습니다."],
+    ["Understood. I will register this as a task and start right away."],
+    ["指示を確認しました。タスクとして登録し、すぐ着手します。"],
+    ["已确认指示。我会先登记任务并立即开始执行。"],
+  ), lang);
+  sendAgentMessage(agent, ack, "task_assign", "agent", null, taskId);
+
+  broadcast("task_update", db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId));
+  broadcast("agent_status", db.prepare("SELECT * FROM agents WHERE id = ?").get(agent.id));
+
+  setTimeout(() => {
+    if (isTaskWorkflowInterrupted(taskId)) return;
+    startTaskExecutionForAgent(taskId, agent, deptId, deptName);
+  }, randomDelay(900, 1600));
+}
 
 function scheduleAgentReply(agentId: string, ceoMessage: string, messageType: string): void {
   const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
   if (!agent) return;
 
-  // If it's a task_assign to a team leader, use delegation flow
-  if (messageType === "task_assign" && agent.role === "team_leader" && agent.department_id) {
-    handleTaskDelegation(agent, ceoMessage, "");
-    return;
-  }
-
   if (agent.status === "offline") {
     const lang = resolveLang(ceoMessage);
     sendAgentMessage(agent, buildCliFailureMessage(agent, lang, "offline"));
+    return;
+  }
+
+  const useTaskFlow = shouldTreatDirectChatAsTask(ceoMessage, messageType);
+  if (useTaskFlow) {
+    if (agent.role === "team_leader" && agent.department_id) {
+      handleTaskDelegation(agent, ceoMessage, "");
+    } else {
+      createDirectAgentTaskAndRun(agent, ceoMessage);
+    }
     return;
   }
 

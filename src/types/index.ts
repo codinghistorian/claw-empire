@@ -133,6 +133,7 @@ export type WSEventType =
   | 'new_message'
   | 'announcement'
   | 'cli_output'
+  | 'cli_usage_update'
   | 'connected';
 
 export interface WSEvent {

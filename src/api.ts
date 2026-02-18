@@ -208,7 +208,10 @@ export interface OAuthProviderStatus {
   expires_at: number | null;
   created_at: number;
   updated_at: number;
+  webConnectable: boolean;
 }
+
+export type OAuthConnectProvider = "github" | "google";
 
 export interface OAuthStatus {
   storageReady: boolean;
@@ -217,6 +220,15 @@ export interface OAuthStatus {
 
 export async function getOAuthStatus(): Promise<OAuthStatus> {
   return request<OAuthStatus>('/api/oauth/status');
+}
+
+export function getOAuthStartUrl(provider: OAuthConnectProvider, redirectTo: string): string {
+  const params = new URLSearchParams({ provider, redirect_to: redirectTo });
+  return `/api/oauth/start?${params.toString()}`;
+}
+
+export async function disconnectOAuth(provider: OAuthConnectProvider): Promise<void> {
+  await post('/api/oauth/disconnect', { provider });
 }
 
 // Git Worktree management
@@ -259,14 +271,21 @@ export async function getWorktrees(): Promise<{ ok: boolean; worktrees: Worktree
 }
 
 // CLI Usage
+export interface CliUsageWindow {
+  label: string;           // "5-hour", "7-day", "Primary", "2.5 Pro", etc.
+  utilization: number;     // 0.0 – 1.0
+  resetsAt: string | null; // ISO 8601
+}
+
 export interface CliUsageEntry {
-  tasksToday: number;
-  tasksActive: number;
-  tasksTotal: number;
-  dailyLimit: number;
-  percentage: number;
+  windows: CliUsageWindow[];
+  error: string | null;    // "unauthenticated" | "unavailable" | "not_implemented" | null
 }
 
 export async function getCliUsage(): Promise<{ ok: boolean; usage: Record<string, CliUsageEntry> }> {
   return request<{ ok: boolean; usage: Record<string, CliUsageEntry> }>('/api/cli-usage');
+}
+
+export async function refreshCliUsage(): Promise<{ ok: boolean; usage: Record<string, CliUsageEntry> }> {
+  return post('/api/cli-usage/refresh') as Promise<{ ok: boolean; usage: Record<string, CliUsageEntry> }>;
 }

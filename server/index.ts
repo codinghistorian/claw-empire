@@ -91,6 +91,49 @@ function decryptSecret(payload: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// OAuth web-auth constants & PKCE helpers
+// ---------------------------------------------------------------------------
+const OAUTH_BASE_URL = process.env.OAUTH_BASE_URL || `http://${HOST}:${PORT}`;
+
+const OAUTH_GITHUB_CLIENT_ID = process.env.OAUTH_GITHUB_CLIENT_ID || "";
+const OAUTH_GITHUB_CLIENT_SECRET = process.env.OAUTH_GITHUB_CLIENT_SECRET || "";
+const OAUTH_GOOGLE_CLIENT_ID = process.env.OAUTH_GOOGLE_CLIENT_ID || "";
+const OAUTH_GOOGLE_CLIENT_SECRET = process.env.OAUTH_GOOGLE_CLIENT_SECRET || "";
+
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function b64url(buf: Buffer): string {
+  return buf.toString("base64url");
+}
+
+function pkceVerifier(): string {
+  return b64url(randomBytes(32));
+}
+
+async function pkceChallengeS256(verifier: string): Promise<string> {
+  return b64url(createHash("sha256").update(verifier, "ascii").digest());
+}
+
+// ---------------------------------------------------------------------------
+// OAuth helper functions
+// ---------------------------------------------------------------------------
+function sanitizeOAuthRedirect(raw: string | undefined): string {
+  if (!raw) return "/";
+  try {
+    const u = new URL(raw);
+    if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return raw;
+  } catch { /* not absolute URL — treat as path */ }
+  if (raw.startsWith("/")) return raw;
+  return "/";
+}
+
+function appendOAuthQuery(url: string, key: string, val: string): string {
+  const u = new URL(url);
+  u.searchParams.set(key, val);
+  return u.toString();
+}
+
+// ---------------------------------------------------------------------------
 // Production static file serving
 // ---------------------------------------------------------------------------
 const distDir = path.resolve(__server_dirname, "..", "dist");
@@ -209,12 +252,30 @@ CREATE TABLE IF NOT EXISTS oauth_credentials (
   updated_at INTEGER DEFAULT (unixepoch()*1000)
 );
 
+CREATE TABLE IF NOT EXISTS oauth_states (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  verifier_enc TEXT NOT NULL,
+  redirect_to TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cli_usage_cache (
+  provider TEXT PRIMARY KEY,
+  data_json TEXT NOT NULL,
+  updated_at INTEGER DEFAULT (unixepoch()*1000)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(assigned_agent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_dept ON tasks(department_id);
 CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_type, receiver_id, created_at DESC);
 `);
+
+// Add columns to oauth_credentials for web-oauth tokens (safe to run repeatedly)
+try { db.exec("ALTER TABLE oauth_credentials ADD COLUMN access_token_enc TEXT"); } catch { /* already exists */ }
+try { db.exec("ALTER TABLE oauth_credentials ADD COLUMN refresh_token_enc TEXT"); } catch { /* already exists */ }
 
 // ---------------------------------------------------------------------------
 // Seed default data
@@ -683,6 +744,316 @@ function fileExistsNonEmpty(filePath: string): boolean {
   }
 }
 
+// ---------------------------------------------------------------------------
+// CLI Usage Types
+// ---------------------------------------------------------------------------
+interface CliUsageWindow {
+  label: string;
+  utilization: number;
+  resetsAt: string | null;
+}
+
+interface CliUsageEntry {
+  windows: CliUsageWindow[];
+  error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Credential Readers
+// ---------------------------------------------------------------------------
+function readClaudeToken(): string | null {
+  // macOS Keychain first (primary on macOS)
+  if (process.platform === "darwin") {
+    try {
+      const raw = execFileSync("security", [
+        "find-generic-password", "-s", "Claude Code-credentials", "-w",
+      ], { timeout: 3000 }).toString().trim();
+      const j = JSON.parse(raw);
+      if (j?.claudeAiOauth?.accessToken) return j.claudeAiOauth.accessToken;
+    } catch { /* ignore */ }
+  }
+  // Fallback: file on disk
+  const home = os.homedir();
+  try {
+    const credsPath = path.join(home, ".claude", ".credentials.json");
+    if (fs.existsSync(credsPath)) {
+      const j = JSON.parse(fs.readFileSync(credsPath, "utf8"));
+      if (j?.claudeAiOauth?.accessToken) return j.claudeAiOauth.accessToken;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function readCodexTokens(): { access_token: string; account_id: string } | null {
+  try {
+    const authPath = path.join(os.homedir(), ".codex", "auth.json");
+    const j = JSON.parse(fs.readFileSync(authPath, "utf8"));
+    if (j?.tokens?.access_token && j?.tokens?.account_id) {
+      return { access_token: j.tokens.access_token, account_id: j.tokens.account_id };
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+// Gemini OAuth client credentials (public installed-app creds from Gemini CLI source;
+// safe to embed per Google's installed app guidelines)
+const GEMINI_OAUTH_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GEMINI_OAUTH_CLIENT_SECRET = "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";
+
+interface GeminiCreds {
+  access_token: string;
+  refresh_token: string;
+  expiry_date: number;
+  source: "keychain" | "file";
+}
+
+function readGeminiCredsFromKeychain(): GeminiCreds | null {
+  if (process.platform !== "darwin") return null;
+  try {
+    const raw = execFileSync("security", [
+      "find-generic-password", "-s", "gemini-cli-oauth", "-a", "main-account", "-w",
+    ], { timeout: 3000, stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+    if (!raw) return null;
+    const stored = JSON.parse(raw);
+    if (!stored?.token?.accessToken) return null;
+    return {
+      access_token: stored.token.accessToken,
+      refresh_token: stored.token.refreshToken ?? "",
+      expiry_date: stored.token.expiresAt ?? 0,
+      source: "keychain",
+    };
+  } catch { return null; }
+}
+
+function readGeminiCredsFromFile(): GeminiCreds | null {
+  try {
+    const p = path.join(os.homedir(), ".gemini", "oauth_creds.json");
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (j?.access_token) {
+      return {
+        access_token: j.access_token,
+        refresh_token: j.refresh_token ?? "",
+        expiry_date: j.expiry_date ?? 0,
+        source: "file",
+      };
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function readGeminiCreds(): GeminiCreds | null {
+  // macOS Keychain first, then file fallback
+  return readGeminiCredsFromKeychain() ?? readGeminiCredsFromFile();
+}
+
+async function freshGeminiToken(): Promise<string | null> {
+  const creds = readGeminiCreds();
+  if (!creds) return null;
+  // If not expired (5-minute buffer), reuse
+  if (creds.expiry_date > Date.now() + 300_000) return creds.access_token;
+  // Cannot refresh without refresh_token
+  if (!creds.refresh_token) return creds.access_token; // try existing token anyway
+  // Refresh using Gemini CLI's public OAuth client credentials
+  try {
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: GEMINI_OAUTH_CLIENT_ID,
+        client_secret: GEMINI_OAUTH_CLIENT_SECRET,
+        refresh_token: creds.refresh_token,
+        grant_type: "refresh_token",
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return creds.access_token; // fall back to existing token
+    const data = await resp.json() as { access_token?: string; expires_in?: number; refresh_token?: string };
+    if (!data.access_token) return creds.access_token;
+    // Persist refreshed token back to file (only if source was file)
+    if (creds.source === "file") {
+      try {
+        const p = path.join(os.homedir(), ".gemini", "oauth_creds.json");
+        const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+        raw.access_token = data.access_token;
+        if (data.refresh_token) raw.refresh_token = data.refresh_token;
+        raw.expiry_date = Date.now() + (data.expires_in ?? 3600) * 1000;
+        fs.writeFileSync(p, JSON.stringify(raw, null, 2), { mode: 0o600 });
+      } catch { /* ignore write failure */ }
+    }
+    return data.access_token;
+  } catch { return creds.access_token; } // fall back to existing token on network error
+}
+
+// ---------------------------------------------------------------------------
+// Provider Fetch Functions
+// ---------------------------------------------------------------------------
+
+// Claude: utilization is already 0-100 (percentage), NOT a fraction
+async function fetchClaudeUsage(): Promise<CliUsageEntry> {
+  const token = readClaudeToken();
+  if (!token) return { windows: [], error: "unauthenticated" };
+  try {
+    const resp = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { windows: [], error: `http_${resp.status}` };
+    const data = await resp.json() as Record<string, { utilization?: number; resets_at?: string } | null>;
+    const windows: CliUsageWindow[] = [];
+    const labelMap: Record<string, string> = {
+      five_hour: "5-hour",
+      seven_day: "7-day",
+      seven_day_sonnet: "7-day Sonnet",
+      seven_day_opus: "7-day Opus",
+    };
+    for (const [key, label] of Object.entries(labelMap)) {
+      const entry = data[key];
+      if (entry) {
+        windows.push({
+          label,
+          utilization: Math.round(entry.utilization ?? 0) / 100, // API returns 0-100, normalize to 0-1
+          resetsAt: entry.resets_at ?? null,
+        });
+      }
+    }
+    return { windows, error: null };
+  } catch {
+    return { windows: [], error: "unavailable" };
+  }
+}
+
+// Codex: uses primary_window/secondary_window with used_percent (0-100), reset_at is Unix seconds
+async function fetchCodexUsage(): Promise<CliUsageEntry> {
+  const tokens = readCodexTokens();
+  if (!tokens) return { windows: [], error: "unauthenticated" };
+  try {
+    const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+      headers: {
+        "Authorization": `Bearer ${tokens.access_token}`,
+        "ChatGPT-Account-Id": tokens.account_id,
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { windows: [], error: `http_${resp.status}` };
+    const data = await resp.json() as {
+      rate_limit?: {
+        primary_window?: { used_percent?: number; reset_at?: number };
+        secondary_window?: { used_percent?: number; reset_at?: number };
+      };
+    };
+    const windows: CliUsageWindow[] = [];
+    if (data.rate_limit?.primary_window) {
+      const pw = data.rate_limit.primary_window;
+      windows.push({
+        label: "5-hour",
+        utilization: (pw.used_percent ?? 0) / 100,
+        resetsAt: pw.reset_at ? new Date(pw.reset_at * 1000).toISOString() : null,
+      });
+    }
+    if (data.rate_limit?.secondary_window) {
+      const sw = data.rate_limit.secondary_window;
+      windows.push({
+        label: "7-day",
+        utilization: (sw.used_percent ?? 0) / 100,
+        resetsAt: sw.reset_at ? new Date(sw.reset_at * 1000).toISOString() : null,
+      });
+    }
+    return { windows, error: null };
+  } catch {
+    return { windows: [], error: "unavailable" };
+  }
+}
+
+// Gemini: requires project ID from loadCodeAssist, then POST retrieveUserQuota
+let geminiProjectCache: { id: string; fetchedAt: number } | null = null;
+const GEMINI_PROJECT_TTL = 300_000; // 5 minutes
+
+async function getGeminiProjectId(token: string): Promise<string | null> {
+  // 1. Environment variable (CI / custom setups)
+  const envProject = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
+  if (envProject) return envProject;
+
+  // 2. Gemini CLI settings file
+  try {
+    const settingsPath = path.join(os.homedir(), ".gemini", "settings.json");
+    const j = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    if (j?.cloudaicompanionProject) return j.cloudaicompanionProject;
+  } catch { /* ignore */ }
+
+  // 3. In-memory cache with TTL
+  if (geminiProjectCache && Date.now() - geminiProjectCache.fetchedAt < GEMINI_PROJECT_TTL) {
+    return geminiProjectCache.id;
+  }
+
+  // 4. Fetch via loadCodeAssist API (discovers project for the authenticated user)
+  try {
+    const resp = await fetch("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        metadata: { ideType: "GEMINI_CLI", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json() as { cloudaicompanionProject?: string };
+    if (data.cloudaicompanionProject) {
+      geminiProjectCache = { id: data.cloudaicompanionProject, fetchedAt: Date.now() };
+      return geminiProjectCache.id;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+async function fetchGeminiUsage(): Promise<CliUsageEntry> {
+  const token = await freshGeminiToken();
+  if (!token) return { windows: [], error: "unauthenticated" };
+
+  const projectId = await getGeminiProjectId(token);
+  if (!projectId) return { windows: [], error: "unavailable" };
+
+  try {
+    const resp = await fetch("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project: projectId }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return { windows: [], error: `http_${resp.status}` };
+    const data = await resp.json() as {
+      buckets?: Array<{ modelId?: string; remainingFraction?: number; resetTime?: string }>;
+    };
+    const windows: CliUsageWindow[] = [];
+    if (data.buckets) {
+      for (const b of data.buckets) {
+        // Skip _vertex duplicates
+        if (b.modelId?.endsWith("_vertex")) continue;
+        windows.push({
+          label: b.modelId ?? "Quota",
+          utilization: Math.round((1 - (b.remainingFraction ?? 1)) * 100) / 100,
+          resetsAt: b.resetTime ?? null,
+        });
+      }
+    }
+    return { windows, error: null };
+  } catch {
+    return { windows: [], error: "unavailable" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLI Tool Definitions
+// ---------------------------------------------------------------------------
+
 const CLI_TOOLS: CliToolDef[] = [
   {
     name: "claude",
@@ -707,7 +1078,11 @@ const CLI_TOOLS: CliToolDef[] = [
     name: "gemini",
     authHint: "Run: gemini auth login",
     checkAuth: () => {
+      // macOS Keychain
+      if (readGeminiCredsFromKeychain()) return true;
+      // File-based credentials
       if (jsonHasKey(path.join(os.homedir(), ".gemini", "oauth_creds.json"), "access_token")) return true;
+      // Windows gcloud ADC fallback
       const appData = process.env.APPDATA;
       if (appData && jsonHasKey(path.join(appData, "gcloud", "application_default_credentials.json"), "client_id")) return true;
       return false;
@@ -1056,6 +1431,9 @@ function finishReview(taskId: string, taskTitle: string): void {
 
   const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
   broadcast("task_update", updatedTask);
+
+  // Refresh CLI usage data in background after task completion
+  refreshCliUsageData().then((usage) => broadcast("cli_usage_update", usage)).catch(() => {});
 
   const leader = findTeamLeader(currentTask.department_id);
   const leaderName = leader?.name_ko || leader?.name || "팀장";
@@ -3204,15 +3582,213 @@ app.get("/api/tasks/:id/terminal", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// OAuth web-auth helper functions
+// ---------------------------------------------------------------------------
+function consumeOAuthState(stateId: string, provider: string): { verifier_enc: string; redirect_to: string | null } | null {
+  const row = db.prepare(
+    "SELECT provider, verifier_enc, redirect_to, created_at FROM oauth_states WHERE id = ?"
+  ).get(stateId) as { provider: string; verifier_enc: string; redirect_to: string | null; created_at: number } | undefined;
+  if (!row) return null;
+  // Always delete (one-time use)
+  db.prepare("DELETE FROM oauth_states WHERE id = ?").run(stateId);
+  // Check TTL
+  if (Date.now() - row.created_at > OAUTH_STATE_TTL_MS) return null;
+  // Check provider match
+  if (row.provider !== provider) return null;
+  return { verifier_enc: row.verifier_enc, redirect_to: row.redirect_to };
+}
+
+function upsertOAuthCredential(input: {
+  provider: string;
+  source: string;
+  email: string | null;
+  scope: string | null;
+  access_token: string;
+  refresh_token: string | null;
+  expires_at: number | null;
+}): void {
+  const now = nowMs();
+  const accessEnc = encryptSecret(input.access_token);
+  const refreshEnc = input.refresh_token ? encryptSecret(input.refresh_token) : null;
+  const encData = encryptSecret(JSON.stringify({ access_token: input.access_token }));
+
+  db.prepare(`
+    INSERT INTO oauth_credentials (provider, source, encrypted_data, email, scope, expires_at, created_at, updated_at, access_token_enc, refresh_token_enc)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(provider) DO UPDATE SET
+      source = excluded.source,
+      encrypted_data = excluded.encrypted_data,
+      email = excluded.email,
+      scope = excluded.scope,
+      expires_at = excluded.expires_at,
+      updated_at = excluded.updated_at,
+      access_token_enc = excluded.access_token_enc,
+      refresh_token_enc = excluded.refresh_token_enc
+  `).run(
+    input.provider, input.source, encData, input.email, input.scope,
+    input.expires_at, now, now, accessEnc, refreshEnc
+  );
+}
+
+function startGitHubOAuth(redirectTo: string | undefined, callbackPath: string): string {
+  if (!OAUTH_GITHUB_CLIENT_ID) throw new Error("OAUTH_GITHUB_CLIENT_ID not configured");
+  const stateId = randomUUID();
+  const safeRedirect = sanitizeOAuthRedirect(redirectTo);
+  // Store state (verifier not used for GitHub, but store placeholder)
+  db.prepare(
+    "INSERT INTO oauth_states (id, provider, created_at, verifier_enc, redirect_to) VALUES (?, ?, ?, ?, ?)"
+  ).run(stateId, "github", Date.now(), "", safeRedirect);
+
+  const params = new URLSearchParams({
+    client_id: OAUTH_GITHUB_CLIENT_ID,
+    redirect_uri: `${OAUTH_BASE_URL}${callbackPath}`,
+    scope: "read:user user:email",
+    state: stateId,
+  });
+  return `https://github.com/login/oauth/authorize?${params.toString()}`;
+}
+
+function startGoogleOAuth(redirectTo: string | undefined, callbackPath: string): string {
+  if (!OAUTH_GOOGLE_CLIENT_ID) throw new Error("OAUTH_GOOGLE_CLIENT_ID not configured");
+  const stateId = randomUUID();
+  const verifier = pkceVerifier();
+  const safeRedirect = sanitizeOAuthRedirect(redirectTo);
+  // Store state with encrypted PKCE verifier
+  const verifierEnc = encryptSecret(verifier);
+  db.prepare(
+    "INSERT INTO oauth_states (id, provider, created_at, verifier_enc, redirect_to) VALUES (?, ?, ?, ?, ?)"
+  ).run(stateId, "google", Date.now(), verifierEnc, safeRedirect);
+
+  // pkceChallengeS256 is async, but we compute synchronously since createHash is sync
+  const challenge = b64url(createHash("sha256").update(verifier, "ascii").digest());
+
+  const params = new URLSearchParams({
+    client_id: OAUTH_GOOGLE_CLIENT_ID,
+    redirect_uri: `${OAUTH_BASE_URL}${callbackPath}`,
+    response_type: "code",
+    scope: "openid email profile",
+    state: stateId,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    access_type: "offline",
+    prompt: "consent",
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+async function handleGitHubCallback(code: string, stateId: string, callbackPath: string): Promise<{ redirectTo: string }> {
+  const stateRow = consumeOAuthState(stateId, "github");
+  if (!stateRow) throw new Error("Invalid or expired state");
+
+  // Exchange code for token
+  const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      client_id: OAUTH_GITHUB_CLIENT_ID,
+      client_secret: OAUTH_GITHUB_CLIENT_SECRET,
+      code,
+      redirect_uri: `${OAUTH_BASE_URL}${callbackPath}`,
+    }),
+    signal: AbortSignal.timeout(10000),
+  });
+  const tokenData = await tokenResp.json() as { access_token?: string; error?: string; scope?: string };
+  if (!tokenData.access_token) throw new Error(tokenData.error || "No access token received");
+
+  // Fetch user info
+  const userResp = await fetch("https://api.github.com/user", {
+    headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(8000),
+  });
+  const userData = await userResp.json() as { login?: string; email?: string };
+
+  // Fetch primary email if not public
+  let email = userData.email || userData.login || null;
+  if (!userData.email) {
+    try {
+      const emailResp = await fetch("https://api.github.com/user/emails", {
+        headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(5000),
+      });
+      const emails = await emailResp.json() as Array<{ email: string; primary: boolean }>;
+      const primary = emails.find((e) => e.primary);
+      if (primary) email = primary.email;
+    } catch { /* use login as fallback */ }
+  }
+
+  upsertOAuthCredential({
+    provider: "github",
+    source: "web-oauth",
+    email,
+    scope: tokenData.scope || "read:user,user:email",
+    access_token: tokenData.access_token,
+    refresh_token: null,
+    expires_at: null,
+  });
+
+  const redirect = stateRow.redirect_to || "/";
+  return { redirectTo: appendOAuthQuery(redirect.startsWith("/") ? `${OAUTH_BASE_URL}${redirect}` : redirect, "oauth", "github") };
+}
+
+async function handleGoogleCallback(code: string, stateId: string, callbackPath: string): Promise<{ redirectTo: string }> {
+  const stateRow = consumeOAuthState(stateId, "google");
+  if (!stateRow) throw new Error("Invalid or expired state");
+
+  // Decrypt PKCE verifier
+  const verifier = decryptSecret(stateRow.verifier_enc);
+
+  // Exchange code for token
+  const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: OAUTH_GOOGLE_CLIENT_ID,
+      client_secret: OAUTH_GOOGLE_CLIENT_SECRET,
+      code,
+      redirect_uri: `${OAUTH_BASE_URL}${callbackPath}`,
+      grant_type: "authorization_code",
+      code_verifier: verifier,
+    }),
+    signal: AbortSignal.timeout(10000),
+  });
+  const tokenData = await tokenResp.json() as {
+    access_token?: string; refresh_token?: string; expires_in?: number;
+    id_token?: string; error?: string; scope?: string;
+  };
+  if (!tokenData.access_token) throw new Error(tokenData.error || "No access token received");
+
+  // Fetch user info
+  const userResp = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    signal: AbortSignal.timeout(8000),
+  });
+  const userData = await userResp.json() as { email?: string; name?: string };
+
+  const expiresAt = tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : null;
+
+  upsertOAuthCredential({
+    provider: "google",
+    source: "web-oauth",
+    email: userData.email || null,
+    scope: tokenData.scope || "openid email profile",
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token || null,
+    expires_at: expiresAt,
+  });
+
+  const redirect = stateRow.redirect_to || "/";
+  return { redirectTo: appendOAuthQuery(redirect.startsWith("/") ? `${OAUTH_BASE_URL}${redirect}` : redirect, "oauth", "google") };
+}
+
+// ---------------------------------------------------------------------------
 // OAuth credentials (simplified for CLImpire)
 // ---------------------------------------------------------------------------
 app.get("/api/oauth/status", (_req, res) => {
   const home = os.homedir();
-  const now = nowMs();
 
-  // 1. DB-stored OAuth credentials
+  // 1. DB-stored OAuth credentials (including web-oauth)
   const rows = db.prepare(
-    "SELECT provider, source, email, scope, expires_at, created_at, updated_at FROM oauth_credentials"
+    "SELECT provider, source, email, scope, expires_at, created_at, updated_at, access_token_enc FROM oauth_credentials"
   ).all() as Array<{
     provider: string;
     source: string | null;
@@ -3221,6 +3797,7 @@ app.get("/api/oauth/status", (_req, res) => {
     expires_at: number | null;
     created_at: number;
     updated_at: number;
+    access_token_enc: string | null;
   }>;
 
   const providers: Record<string, {
@@ -3231,17 +3808,19 @@ app.get("/api/oauth/status", (_req, res) => {
     expires_at: number | null;
     created_at: number;
     updated_at: number;
+    webConnectable: boolean;
   }> = {};
 
   for (const row of rows) {
     providers[row.provider] = {
       connected: true,
-      source: row.source,
+      source: row.access_token_enc ? "web-oauth" : (row.source || "db"),
       email: row.email,
       scope: row.scope,
       expires_at: row.expires_at,
       created_at: row.created_at,
       updated_at: row.updated_at,
+      webConnectable: row.provider === "github" || row.provider === "google",
     };
   }
 
@@ -3253,20 +3832,19 @@ app.get("/api/oauth/status", (_req, res) => {
     try {
       const hostsPath = path.join(home, ".config", "gh", "hosts.yml");
       const raw = fs.readFileSync(hostsPath, "utf8");
-      // Parse simple YAML: look for "user:" line
       const userMatch = raw.match(/user:\s*(\S+)/);
       if (userMatch) {
         const ghUser = userMatch[1];
-        // Check file mtime for created_at
         const stat = fs.statSync(hostsPath);
         providers.github = {
           connected: true,
-          source: "gh-cli",
+          source: "file-detected",
           email: ghUser,
           scope: "github.com",
           expires_at: null,
           created_at: stat.birthtimeMs,
           updated_at: stat.mtimeMs,
+          webConnectable: true,
         };
       }
     } catch {}
@@ -3286,12 +3864,13 @@ app.get("/api/oauth/status", (_req, res) => {
           const firstKey = Object.keys(raw)[0];
           providers.copilot = {
             connected: true,
-            source: "github-copilot",
+            source: "file-detected",
             email: raw[firstKey]?.user ?? null,
             scope: "copilot",
             expires_at: null,
             created_at: stat.birthtimeMs,
             updated_at: stat.mtimeMs,
+            webConnectable: false,
           };
           break;
         }
@@ -3308,12 +3887,13 @@ app.get("/api/oauth/status", (_req, res) => {
         const stat = fs.statSync(adcPath);
         providers.google = {
           connected: true,
-          source: "gcloud",
+          source: "file-detected",
           email: raw.client_email ?? raw.account ?? null,
           scope: raw.type ?? "authorized_user",
           expires_at: null,
           created_at: stat.birthtimeMs,
           updated_at: stat.mtimeMs,
+          webConnectable: true,
         };
       }
     } catch {}
@@ -3333,12 +3913,13 @@ app.get("/api/oauth/status", (_req, res) => {
           const stat = fs.statSync(ap);
           providers.antigravity = {
             connected: true,
-            source: "antigravity-cli",
+            source: "file-detected",
             email: raw.email ?? raw.user ?? null,
             scope: raw.scope ?? null,
             expires_at: raw.expires_at ?? null,
             created_at: stat.birthtimeMs,
             updated_at: stat.mtimeMs,
+            webConnectable: false,
           };
           break;
         }
@@ -3346,10 +3927,111 @@ app.get("/api/oauth/status", (_req, res) => {
     }
   }
 
+  // Always include github and google with webConnectable flag
+  // webConnectable = true when OAuth client IDs are configured
+  const ghConnectable = Boolean(OAUTH_GITHUB_CLIENT_ID);
+  const goConnectable = Boolean(OAUTH_GOOGLE_CLIENT_ID);
+
+  if (providers.github) {
+    providers.github.webConnectable = ghConnectable;
+  } else {
+    providers.github = {
+      connected: false, source: null, email: null, scope: null,
+      expires_at: null, created_at: 0, updated_at: 0, webConnectable: ghConnectable,
+    };
+  }
+  if (providers.google) {
+    providers.google.webConnectable = goConnectable;
+  } else {
+    providers.google = {
+      connected: false, source: null, email: null, scope: null,
+      expires_at: null, created_at: 0, updated_at: 0, webConnectable: goConnectable,
+    };
+  }
+
   res.json({
-    storageReady: true,
+    storageReady: Boolean(OAUTH_ENCRYPTION_SECRET),
     providers,
   });
+});
+
+// GET /api/oauth/start — Begin OAuth flow
+app.get("/api/oauth/start", (req, res) => {
+  const provider = firstQueryValue(req.query.provider);
+  const redirectTo = firstQueryValue(req.query.redirect_to);
+
+  try {
+    let authorizeUrl: string;
+    if (provider === "github") {
+      authorizeUrl = startGitHubOAuth(redirectTo, "/api/oauth/callback/github");
+    } else if (provider === "google") {
+      authorizeUrl = startGoogleOAuth(redirectTo, "/api/oauth/callback/google");
+    } else {
+      return res.status(400).json({ error: `Unsupported provider: ${provider}` });
+    }
+    res.redirect(authorizeUrl);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+// GET /api/oauth/callback/github — GitHub OAuth callback
+app.get("/api/oauth/callback/github", async (req, res) => {
+  const code = firstQueryValue(req.query.code);
+  const state = firstQueryValue(req.query.state);
+  const error = firstQueryValue(req.query.error);
+
+  if (error || !code || !state) {
+    const redirectUrl = new URL("/", OAUTH_BASE_URL);
+    redirectUrl.searchParams.set("oauth_error", error || "missing_code");
+    return res.redirect(redirectUrl.toString());
+  }
+
+  try {
+    const result = await handleGitHubCallback(code, state, "/api/oauth/callback/github");
+    res.redirect(result.redirectTo);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[OAuth] GitHub callback error:", msg);
+    const redirectUrl = new URL("/", OAUTH_BASE_URL);
+    redirectUrl.searchParams.set("oauth_error", msg);
+    res.redirect(redirectUrl.toString());
+  }
+});
+
+// GET /api/oauth/callback/google — Google OAuth callback
+app.get("/api/oauth/callback/google", async (req, res) => {
+  const code = firstQueryValue(req.query.code);
+  const state = firstQueryValue(req.query.state);
+  const error = firstQueryValue(req.query.error);
+
+  if (error || !code || !state) {
+    const redirectUrl = new URL("/", OAUTH_BASE_URL);
+    redirectUrl.searchParams.set("oauth_error", error || "missing_code");
+    return res.redirect(redirectUrl.toString());
+  }
+
+  try {
+    const result = await handleGoogleCallback(code, state, "/api/oauth/callback/google");
+    res.redirect(result.redirectTo);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[OAuth] Google callback error:", msg);
+    const redirectUrl = new URL("/", OAUTH_BASE_URL);
+    redirectUrl.searchParams.set("oauth_error", msg);
+    res.redirect(redirectUrl.toString());
+  }
+});
+
+// POST /api/oauth/disconnect — Disconnect a provider
+app.post("/api/oauth/disconnect", (req, res) => {
+  const provider = (req.body as { provider?: string })?.provider;
+  if (!provider || typeof provider !== "string") {
+    return res.status(400).json({ error: "provider is required" });
+  }
+  db.prepare("DELETE FROM oauth_credentials WHERE provider = ?").run(provider);
+  res.json({ ok: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -3436,73 +4118,80 @@ app.get("/api/worktrees", (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// CLI Usage stats (per-provider task usage)
+// CLI Usage stats (real provider API usage, persisted in SQLite)
 // ---------------------------------------------------------------------------
-app.get("/api/cli-usage", (_req, res) => {
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const todayMs = todayStart.getTime();
 
-  // Tasks completed per provider today
-  const todayRows = db.prepare(`
-    SELECT a.cli_provider AS provider, COUNT(*) AS cnt
-    FROM tasks t
-    JOIN agents a ON t.assigned_agent_id = a.id
-    WHERE t.completed_at >= ? AND t.status = 'done'
-    GROUP BY a.cli_provider
-  `).all(todayMs) as Array<{ provider: string; cnt: number }>;
+// Read cached usage from SQLite
+function readCliUsageFromDb(): Record<string, CliUsageEntry> {
+  const rows = db.prepare("SELECT provider, data_json FROM cli_usage_cache").all() as Array<{ provider: string; data_json: string }>;
+  const usage: Record<string, CliUsageEntry> = {};
+  for (const row of rows) {
+    try { usage[row.provider] = JSON.parse(row.data_json); } catch { /* skip corrupt */ }
+  }
+  return usage;
+}
 
-  // Tasks in progress per provider
-  const activeRows = db.prepare(`
-    SELECT a.cli_provider AS provider, COUNT(*) AS cnt
-    FROM tasks t
-    JOIN agents a ON t.assigned_agent_id = a.id
-    WHERE t.status = 'in_progress'
-    GROUP BY a.cli_provider
-  `).all() as Array<{ provider: string; cnt: number }>;
-
-  // Total tasks per provider (all time)
-  const totalRows = db.prepare(`
-    SELECT a.cli_provider AS provider, COUNT(*) AS cnt
-    FROM tasks t
-    JOIN agents a ON t.assigned_agent_id = a.id
-    WHERE t.status = 'done'
-    GROUP BY a.cli_provider
-  `).all() as Array<{ provider: string; cnt: number }>;
-
+// Fetch real usage from provider APIs and persist to SQLite
+async function refreshCliUsageData(): Promise<Record<string, CliUsageEntry>> {
   const providers = ["claude", "codex", "gemini", "copilot", "antigravity"];
-  const usage: Record<string, {
-    tasksToday: number;
-    tasksActive: number;
-    tasksTotal: number;
-    dailyLimit: number;
-    percentage: number;
-  }> = {};
+  const usage: Record<string, CliUsageEntry> = {};
 
-  // Default daily limits per provider (rough estimates; configurable later)
-  const DAILY_LIMITS: Record<string, number> = {
-    claude: 40, codex: 30, gemini: 50, copilot: 40, antigravity: 20,
+  const fetchMap: Record<string, () => Promise<CliUsageEntry>> = {
+    claude: fetchClaudeUsage,
+    codex: fetchCodexUsage,
+    gemini: fetchGeminiUsage,
   };
 
-  const todayMap = new Map(todayRows.map(r => [r.provider, r.cnt]));
-  const activeMap = new Map(activeRows.map(r => [r.provider, r.cnt]));
-  const totalMap = new Map(totalRows.map(r => [r.provider, r.cnt]));
+  const fetches = providers.map(async (p) => {
+    const tool = CLI_TOOLS.find((t) => t.name === p);
+    if (!tool) {
+      usage[p] = { windows: [], error: "not_implemented" };
+      return;
+    }
+    if (!tool.checkAuth()) {
+      usage[p] = { windows: [], error: "unauthenticated" };
+      return;
+    }
+    const fetcher = fetchMap[p];
+    if (fetcher) {
+      usage[p] = await fetcher();
+    } else {
+      usage[p] = { windows: [], error: "not_implemented" };
+    }
+  });
 
-  for (const p of providers) {
-    const today = todayMap.get(p) ?? 0;
-    const active = activeMap.get(p) ?? 0;
-    const total = totalMap.get(p) ?? 0;
-    const limit = DAILY_LIMITS[p] ?? 30;
-    usage[p] = {
-      tasksToday: today,
-      tasksActive: active,
-      tasksTotal: total,
-      dailyLimit: limit,
-      percentage: Math.min(100, Math.round((today / limit) * 100)),
-    };
+  await Promise.all(fetches);
+
+  // Persist to SQLite
+  const upsert = db.prepare(
+    "INSERT INTO cli_usage_cache (provider, data_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at"
+  );
+  const now = nowMs();
+  for (const [p, entry] of Object.entries(usage)) {
+    upsert.run(p, JSON.stringify(entry), now);
   }
 
+  return usage;
+}
+
+// GET: read from SQLite cache; if empty, fetch and populate first
+app.get("/api/cli-usage", async (_req, res) => {
+  let usage = readCliUsageFromDb();
+  if (Object.keys(usage).length === 0) {
+    usage = await refreshCliUsageData();
+  }
   res.json({ ok: true, usage });
+});
+
+// POST: trigger real API fetches, update SQLite, broadcast to all clients
+app.post("/api/cli-usage/refresh", async (_req, res) => {
+  try {
+    const usage = await refreshCliUsageData();
+    broadcast("cli_usage_update", usage);
+    res.json({ ok: true, usage });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
 });
 
 // ---------------------------------------------------------------------------

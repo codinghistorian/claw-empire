@@ -35,6 +35,11 @@ export interface CrossDeptDelivery {
 
 type View = "office" | "dashboard" | "tasks" | "settings";
 
+export interface OAuthCallbackResult {
+  provider: string | null;
+  error: string | null;
+}
+
 export default function App() {
   // Core state
   const [view, setView] = useState<View>("office");
@@ -55,10 +60,31 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [unreadAgentIds, setUnreadAgentIds] = useState<Set<string>>(new Set());
   const [crossDeptDeliveries, setCrossDeptDeliveries] = useState<CrossDeptDelivery[]>([]);
+  const [oauthResult, setOauthResult] = useState<OAuthCallbackResult | null>(null);
 
   // Ref to track currently open chat (avoids stale closures in WebSocket handlers)
   const activeChatRef = useRef<{ showChat: boolean; agentId: string | null }>({ showChat: false, agentId: null });
   activeChatRef.current = { showChat, agentId: chatAgent?.id ?? null };
+
+  // OAuth callback detection
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oauthProvider = params.get("oauth");
+    const oauthError = params.get("oauth_error");
+    if (oauthProvider || oauthError) {
+      setOauthResult({
+        provider: oauthProvider,
+        error: oauthError,
+      });
+      // Clean URL
+      const clean = new URL(window.location.href);
+      clean.searchParams.delete("oauth");
+      clean.searchParams.delete("oauth_error");
+      window.history.replaceState({}, "", clean.pathname + clean.search);
+      // Switch to settings view
+      setView("settings");
+    }
+  }, []);
 
   // WebSocket
   const { connected, on } = useWebSocket();
@@ -394,7 +420,7 @@ export default function App() {
       />
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto">
+      <main className="flex-1 overflow-y-auto overflow-x-hidden min-w-0">
         {/* Top Bar */}
         <header className="sticky top-0 z-30 bg-slate-900/80 backdrop-blur-sm border-b border-slate-700/50 px-6 py-3 flex items-center justify-between">
           <div>
@@ -489,6 +515,8 @@ export default function App() {
               onRefreshCli={() =>
                 api.getCliStatus(true).then(setCliStatus).catch(console.error)
               }
+              oauthResult={oauthResult}
+              onOauthResultClear={() => setOauthResult(null)}
             />
           )}
         </div>

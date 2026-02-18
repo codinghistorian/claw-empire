@@ -45,7 +45,7 @@ const PKG_VERSION: string = (() => {
   }
 })();
 
-const PORT = Number(process.env.PORT ?? 8787);
+const PORT = Number(process.env.PORT ?? 8790);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const OAUTH_BASE_HOST = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
 const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG ?? "";
@@ -1398,6 +1398,7 @@ function buildAgentArgs(provider: string, model?: string, reasoningLevel?: strin
         "claude",
         "--dangerously-skip-permissions",
         "--print",
+        "--verbose",
         "--output-format=stream-json",
         "--include-partial-messages",
       ];

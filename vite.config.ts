@@ -9,6 +9,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     allowedHosts: [".ts.net"],
+    watch: {
+      ignored: ["**/.climpire-worktrees/**"],
+    },
     proxy: {
       "/api": apiTarget,
       "/ws": { target: wsTarget, ws: true },

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import { randomUUID, createHash, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { WebSocketServer, WebSocket } from "ws";
 import { fileURLToPath } from "node:url";
 import type { IncomingMessage } from "node:http";
@@ -45,7 +45,7 @@ const PKG_VERSION: string = (() => {
   }
 })();
 
-const PORT = Number(process.env.PORT ?? 8787);
+const PORT = Number(process.env.PORT ?? 8790);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const OAUTH_BASE_HOST = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
 const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG ?? "";
@@ -159,6 +159,40 @@ const isProduction = !process.env.VITE_DEV && fs.existsSync(path.join(distDir, "
 const defaultDbPath = path.join(process.cwd(), "claw-empire.sqlite");
 const legacyDbPath = path.join(process.cwd(), "climpire.sqlite");
 
+function readNonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
+const SQLITE_BUSY_TIMEOUT_MS = readNonNegativeIntEnv("SQLITE_BUSY_TIMEOUT_MS", 5000);
+const SQLITE_BUSY_RETRY_MAX_ATTEMPTS = Math.min(readNonNegativeIntEnv("SQLITE_BUSY_RETRY_MAX_ATTEMPTS", 4), 20);
+const SQLITE_BUSY_RETRY_BASE_DELAY_MS = readNonNegativeIntEnv("SQLITE_BUSY_RETRY_BASE_DELAY_MS", 40);
+const SQLITE_BUSY_RETRY_MAX_DELAY_MS = Math.max(
+  SQLITE_BUSY_RETRY_BASE_DELAY_MS,
+  readNonNegativeIntEnv("SQLITE_BUSY_RETRY_MAX_DELAY_MS", 400),
+);
+const SQLITE_BUSY_RETRY_JITTER_MS = readNonNegativeIntEnv("SQLITE_BUSY_RETRY_JITTER_MS", 20);
+const REVIEW_MAX_ROUNDS = Math.max(1, Math.min(readNonNegativeIntEnv("REVIEW_MAX_ROUNDS", 2), 6));
+const REVIEW_MAX_REVISION_SIGNALS_PER_DEPT_PER_ROUND = Math.max(
+  1,
+  Math.min(readNonNegativeIntEnv("REVIEW_MAX_REVISION_SIGNALS_PER_DEPT_PER_ROUND", 2), 10),
+);
+const REVIEW_MAX_REVISION_SIGNALS_PER_ROUND = Math.max(
+  REVIEW_MAX_REVISION_SIGNALS_PER_DEPT_PER_ROUND,
+  Math.min(readNonNegativeIntEnv("REVIEW_MAX_REVISION_SIGNALS_PER_ROUND", 6), 30),
+);
+const REVIEW_MAX_MEMO_ITEMS_PER_DEPT = Math.max(
+  1,
+  Math.min(readNonNegativeIntEnv("REVIEW_MAX_MEMO_ITEMS_PER_DEPT", 2), 8),
+);
+const REVIEW_MAX_MEMO_ITEMS_PER_ROUND = Math.max(
+  REVIEW_MAX_MEMO_ITEMS_PER_DEPT,
+  Math.min(readNonNegativeIntEnv("REVIEW_MAX_MEMO_ITEMS_PER_ROUND", 8), 24),
+);
+
 if (!process.env.DB_PATH && !fs.existsSync(defaultDbPath) && fs.existsSync(legacyDbPath)) {
   fs.renameSync(legacyDbPath, defaultDbPath);
   for (const suffix of ["-wal", "-shm"]) {
@@ -170,8 +204,40 @@ if (!process.env.DB_PATH && !fs.existsSync(defaultDbPath) && fs.existsSync(legac
 const dbPath = process.env.DB_PATH ?? defaultDbPath;
 const db = new DatabaseSync(dbPath);
 db.exec("PRAGMA journal_mode = WAL");
-db.exec("PRAGMA busy_timeout = 3000");
+db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
 db.exec("PRAGMA foreign_keys = ON");
+console.log(
+  `[Claw-Empire] SQLite write resilience: busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}ms, `
+  + `retries=${SQLITE_BUSY_RETRY_MAX_ATTEMPTS}, `
+  + `backoff=${SQLITE_BUSY_RETRY_BASE_DELAY_MS}-${SQLITE_BUSY_RETRY_MAX_DELAY_MS}ms, `
+  + `jitter<=${SQLITE_BUSY_RETRY_JITTER_MS}ms`,
+);
+console.log(
+  `[Claw-Empire] Review guardrails: max_rounds=${REVIEW_MAX_ROUNDS}, `
+  + `hold_cap=${REVIEW_MAX_REVISION_SIGNALS_PER_ROUND}/round, `
+  + `hold_cap_per_dept=${REVIEW_MAX_REVISION_SIGNALS_PER_DEPT_PER_ROUND}, `
+  + `memo_cap=${REVIEW_MAX_MEMO_ITEMS_PER_ROUND}/round, `
+  + `memo_cap_per_dept=${REVIEW_MAX_MEMO_ITEMS_PER_DEPT}`,
+);
+
+function runInTransaction(fn: () => void): void {
+  if (db.isTransaction) {
+    fn();
+    return;
+  }
+  db.exec("BEGIN");
+  try {
+    fn();
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore rollback failure
+    }
+    throw err;
+  }
+}
 
 const logsDir = process.env.LOGS_DIR ?? path.join(process.cwd(), "logs");
 try {
@@ -407,6 +473,487 @@ function firstQueryValue(value: unknown): string | undefined {
   return undefined;
 }
 
+const securityAuditLogPath = path.join(logsDir, "security-audit.ndjson");
+const securityAuditFallbackLogPath = path.join(logsDir, "security-audit-fallback.ndjson");
+const SECURITY_AUDIT_CHAIN_SEED =
+  process.env.SECURITY_AUDIT_CHAIN_SEED?.trim() || "claw-empire-security-audit-v1";
+const SECURITY_AUDIT_CHAIN_KEY = process.env.SECURITY_AUDIT_CHAIN_KEY ?? "";
+
+type MessageIngressAuditOutcome =
+  | "accepted"
+  | "duplicate"
+  | "idempotency_conflict"
+  | "storage_busy"
+  | "validation_error";
+
+type MessageIngressAuditInput = {
+  endpoint: "/api/messages" | "/api/announcements" | "/api/directives" | "/api/inbox";
+  req: {
+    get(name: string): string | undefined;
+    ip?: string;
+    socket?: { remoteAddress?: string };
+  };
+  body: Record<string, unknown>;
+  idempotencyKey: string | null;
+  outcome: MessageIngressAuditOutcome;
+  statusCode: number;
+  messageId?: string | null;
+  detail?: string | null;
+};
+
+type MessageIngressAuditEntry = {
+  id: string;
+  created_at: number;
+  endpoint: string;
+  method: "POST";
+  status_code: number;
+  outcome: MessageIngressAuditOutcome;
+  idempotency_key: string | null;
+  request_id: string | null;
+  message_id: string | null;
+  payload_hash: string;
+  request_ip: string | null;
+  user_agent: string | null;
+  detail: string | null;
+  prev_hash: string;
+  chain_hash: string;
+};
+
+class SecurityAuditLogWriteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SecurityAuditLogWriteError";
+  }
+}
+
+function canonicalizeAuditValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeAuditValue(item));
+  }
+  if (value && typeof value === "object") {
+    const src = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(src).sort()) {
+      out[key] = canonicalizeAuditValue(src[key]);
+    }
+    return out;
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string" && value.length > 8_000) {
+    return `${value.slice(0, 8_000)}...[truncated:${value.length}]`;
+  }
+  return value;
+}
+
+function stableAuditJson(value: unknown): string {
+  try {
+    return JSON.stringify(canonicalizeAuditValue(value));
+  } catch {
+    return JSON.stringify(String(value));
+  }
+}
+
+function normalizeAuditText(value: unknown, maxLength = 500): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, maxLength)}...[truncated:${trimmed.length}]`;
+}
+
+function resolveAuditRequestId(
+  req: { get(name: string): string | undefined },
+  body: Record<string, unknown>,
+): string | null {
+  const candidates: unknown[] = [
+    body.request_id,
+    body.requestId,
+    req.get("x-request-id"),
+    req.get("x-correlation-id"),
+    req.get("traceparent"),
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (trimmed) return trimmed.length <= 200 ? trimmed : trimmed.slice(0, 200);
+  }
+  return null;
+}
+
+function resolveAuditRequestIp(req: {
+  get(name: string): string | undefined;
+  ip?: string;
+  socket?: { remoteAddress?: string };
+}): string | null {
+  const forwarded = req.get("x-forwarded-for");
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first) return first.slice(0, 128);
+  }
+  if (typeof req.ip === "string" && req.ip.trim()) {
+    return req.ip.trim().slice(0, 128);
+  }
+  if (typeof req.socket?.remoteAddress === "string" && req.socket.remoteAddress.trim()) {
+    return req.socket.remoteAddress.trim().slice(0, 128);
+  }
+  return null;
+}
+
+function computeAuditChainHash(
+  prevHash: string,
+  entry: Omit<MessageIngressAuditEntry, "prev_hash" | "chain_hash">,
+): string {
+  const hasher = createHash("sha256");
+  hasher.update(SECURITY_AUDIT_CHAIN_SEED, "utf8");
+  hasher.update("|", "utf8");
+  hasher.update(prevHash, "utf8");
+  hasher.update("|", "utf8");
+  if (SECURITY_AUDIT_CHAIN_KEY) {
+    hasher.update(SECURITY_AUDIT_CHAIN_KEY, "utf8");
+    hasher.update("|", "utf8");
+  }
+  hasher.update(stableAuditJson(entry), "utf8");
+  return hasher.digest("hex");
+}
+
+function loadSecurityAuditPrevHash(): string {
+  try {
+    if (!fs.existsSync(securityAuditLogPath)) return "GENESIS";
+    const raw = fs.readFileSync(securityAuditLogPath, "utf8").trim();
+    if (!raw) return "GENESIS";
+    const lines = raw.split(/\r?\n/);
+    for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
+      const line = lines[idx]?.trim();
+      if (!line) continue;
+      const parsed = JSON.parse(line) as { chain_hash?: unknown };
+      if (typeof parsed.chain_hash === "string" && parsed.chain_hash.trim()) {
+        return parsed.chain_hash.trim();
+      }
+    }
+  } catch (err) {
+    console.warn(`[Claw-Empire] security audit chain bootstrap failed: ${String(err)}`);
+  }
+  return "GENESIS";
+}
+
+let securityAuditPrevHash = loadSecurityAuditPrevHash();
+
+function appendSecurityAuditFallbackLog(payload: unknown): boolean {
+  const line = `${stableAuditJson(payload)}\n`;
+  try {
+    fs.appendFileSync(securityAuditFallbackLogPath, line, { encoding: "utf8", mode: 0o600 });
+    return true;
+  } catch (fallbackErr) {
+    try {
+      process.stderr.write(`[Claw-Empire] security audit fallback append failed: ${String(fallbackErr)}\n${line}`);
+      // Fail closed when neither primary nor fallback file append succeeds.
+      return false;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function appendSecurityAuditLog(entry: Omit<MessageIngressAuditEntry, "prev_hash" | "chain_hash">): void {
+  const prevHash = securityAuditPrevHash;
+  const chainHash = computeAuditChainHash(prevHash, entry);
+  const line = JSON.stringify({ ...entry, prev_hash: prevHash, chain_hash: chainHash });
+  try {
+    fs.appendFileSync(securityAuditLogPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    securityAuditPrevHash = chainHash;
+  } catch (err) {
+    const fallbackOk = appendSecurityAuditFallbackLog({
+      ...entry,
+      prev_hash: prevHash,
+      chain_hash: chainHash,
+      fallback_reason: String(err),
+      fallback_created_at: nowMs(),
+    });
+    const fallbackStatus = fallbackOk ? "fallback_saved" : "fallback_failed";
+    throw new SecurityAuditLogWriteError(
+      `security audit append failed (${fallbackStatus}): ${String(err)}`,
+    );
+  }
+}
+
+function recordMessageIngressAudit(input: MessageIngressAuditInput): void {
+  const payloadHash = createHash("sha256")
+    .update(stableAuditJson(input.body), "utf8")
+    .digest("hex");
+  const entry: Omit<MessageIngressAuditEntry, "prev_hash" | "chain_hash"> = {
+    id: randomUUID(),
+    created_at: nowMs(),
+    endpoint: input.endpoint,
+    method: "POST",
+    status_code: input.statusCode,
+    outcome: input.outcome,
+    idempotency_key: input.idempotencyKey,
+    request_id: resolveAuditRequestId(input.req, input.body),
+    message_id: input.messageId ?? null,
+    payload_hash: payloadHash,
+    request_ip: resolveAuditRequestIp(input.req),
+    user_agent: normalizeAuditText(input.req.get("user-agent"), 200),
+    detail: normalizeAuditText(input.detail),
+  };
+  appendSecurityAuditLog(entry);
+}
+
+function recordMessageIngressAuditOr503(
+  res: { status(code: number): { json(payload: unknown): unknown } },
+  input: MessageIngressAuditInput,
+): boolean {
+  try {
+    recordMessageIngressAudit(input);
+    return true;
+  } catch (err) {
+    console.error(`[Claw-Empire] security audit unavailable: ${String(err)}`);
+    res.status(503).json({ error: "audit_log_unavailable", retryable: true });
+    return false;
+  }
+}
+
+async function rollbackMessageInsertAfterAuditFailure(messageId: string): Promise<void> {
+  await withSqliteBusyRetry("messages.audit_rollback", () => {
+    db.prepare("DELETE FROM messages WHERE id = ?").run(messageId);
+  });
+}
+
+async function recordAcceptedIngressAuditOrRollback(
+  res: { status(code: number): { json(payload: unknown): unknown } },
+  input: Omit<MessageIngressAuditInput, "messageId">,
+  messageId: string,
+): Promise<boolean> {
+  if (recordMessageIngressAuditOr503(res, { ...input, messageId })) return true;
+  try {
+    await rollbackMessageInsertAfterAuditFailure(messageId);
+  } catch (rollbackErr) {
+    console.error(
+      `[Claw-Empire] rollback after audit failure failed: message_id=${messageId}, `
+      + `${String(rollbackErr)}`,
+    );
+  }
+  return false;
+}
+
+const IDEMPOTENCY_KEY_MAX_LENGTH = 200;
+
+type StoredMessage = {
+  id: string;
+  sender_type: string;
+  sender_id: string | null;
+  receiver_type: string;
+  receiver_id: string | null;
+  content: string;
+  message_type: string;
+  task_id: string | null;
+  idempotency_key: string | null;
+  created_at: number;
+};
+
+type MessageInsertInput = {
+  senderType: string;
+  senderId: string | null;
+  receiverType: string;
+  receiverId: string | null;
+  content: string;
+  messageType: string;
+  taskId?: string | null;
+  idempotencyKey?: string | null;
+};
+
+class IdempotencyConflictError extends Error {
+  constructor(public readonly key: string) {
+    super("idempotency_conflict");
+    this.name = "IdempotencyConflictError";
+  }
+}
+
+function isSameMessagePayload(existing: StoredMessage, input: MessageInsertInput, taskId: string | null): boolean {
+  return (
+    existing.sender_type === input.senderType
+    && existing.sender_id === input.senderId
+    && existing.receiver_type === input.receiverType
+    && existing.receiver_id === input.receiverId
+    && existing.content === input.content
+    && existing.message_type === input.messageType
+    && existing.task_id === taskId
+  );
+}
+
+function normalizeIdempotencyKey(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= IDEMPOTENCY_KEY_MAX_LENGTH) return trimmed;
+  return `sha256:${createHash("sha256").update(trimmed, "utf8").digest("hex")}`;
+}
+
+function resolveMessageIdempotencyKey(
+  req: { get(name: string): string | undefined },
+  body: Record<string, unknown>,
+  scope: string,
+): string | null {
+  const normalizedScope = scope.trim().toLowerCase() || "api.messages";
+  const candidates: unknown[] = [
+    body.idempotency_key,
+    body.idempotencyKey,
+    body.request_id,
+    body.requestId,
+    req.get("x-idempotency-key"),
+    req.get("idempotency-key"),
+    req.get("x-request-id"),
+  ];
+  for (const candidate of candidates) {
+    const key = normalizeIdempotencyKey(candidate);
+    if (key) {
+      const digest = createHash("sha256").update(`${normalizedScope}:${key}`, "utf8").digest("hex");
+      return `${normalizedScope}:${digest}`;
+    }
+  }
+  return null;
+}
+
+function findMessageByIdempotencyKey(idempotencyKey: string): StoredMessage | null {
+  const row = db.prepare(`
+    SELECT id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, idempotency_key, created_at
+    FROM messages
+    WHERE idempotency_key = ?
+    LIMIT 1
+  `).get(idempotencyKey) as StoredMessage | undefined;
+  return row ?? null;
+}
+
+function isIdempotencyUniqueViolation(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const message = err.message.toLowerCase();
+  if (!message.includes("unique constraint failed")) return false;
+  return message.includes("messages.idempotency_key") || message.includes("idx_messages_idempotency_key");
+}
+
+class StorageBusyError extends Error {
+  constructor(
+    public readonly operation: string,
+    public readonly attempts: number,
+  ) {
+    super("storage_busy");
+    this.name = "StorageBusyError";
+  }
+}
+
+function isSqliteBusyError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
+  const message = err.message.toLowerCase();
+  return (
+    message.includes("sqlite_busy")
+    || message.includes("sqlite_locked")
+    || message.includes("database is locked")
+    || message.includes("database is busy")
+  );
+}
+
+function sqliteBusyBackoffDelayMs(attempt: number): number {
+  const expo = SQLITE_BUSY_RETRY_BASE_DELAY_MS * (2 ** attempt);
+  const capped = Math.min(expo, SQLITE_BUSY_RETRY_MAX_DELAY_MS);
+  if (SQLITE_BUSY_RETRY_JITTER_MS <= 0) return Math.floor(capped);
+  const jitter = Math.floor(Math.random() * (SQLITE_BUSY_RETRY_JITTER_MS + 1));
+  return Math.floor(capped + jitter);
+}
+
+async function withSqliteBusyRetry<T>(operation: string, fn: () => T): Promise<T> {
+  for (let attempt = 0; attempt <= SQLITE_BUSY_RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = fn();
+      if (attempt > 0) {
+        console.warn(`[Claw-Empire] SQLite busy recovered: op=${operation}, retries=${attempt}`);
+      }
+      return result;
+    } catch (err) {
+      if (!isSqliteBusyError(err)) throw err;
+      if (attempt >= SQLITE_BUSY_RETRY_MAX_ATTEMPTS) {
+        throw new StorageBusyError(operation, attempt + 1);
+      }
+      const waitMs = sqliteBusyBackoffDelayMs(attempt);
+      console.warn(
+        `[Claw-Empire] SQLite busy: op=${operation}, attempt=${attempt + 1}/${SQLITE_BUSY_RETRY_MAX_ATTEMPTS + 1}, `
+        + `retry_in=${waitMs}ms`,
+      );
+      if (waitMs > 0) await sleepMs(waitMs);
+    }
+  }
+
+  throw new StorageBusyError(operation, SQLITE_BUSY_RETRY_MAX_ATTEMPTS + 1);
+}
+
+function insertMessageWithIdempotencyOnce(input: MessageInsertInput): { message: StoredMessage; created: boolean } {
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
+  const taskId = input.taskId ?? null;
+  if (idempotencyKey) {
+    const existing = findMessageByIdempotencyKey(idempotencyKey);
+    if (existing) {
+      if (!isSameMessagePayload(existing, input, taskId)) {
+        throw new IdempotencyConflictError(idempotencyKey);
+      }
+      return { message: existing, created: false };
+    }
+  }
+
+  const id = randomUUID();
+  const createdAt = nowMs();
+  try {
+    db.prepare(`
+      INSERT INTO messages (
+        id, sender_type, sender_id, receiver_type, receiver_id,
+        content, message_type, task_id, idempotency_key, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      input.senderType,
+      input.senderId,
+      input.receiverType,
+      input.receiverId,
+      input.content,
+      input.messageType,
+      taskId,
+      idempotencyKey,
+      createdAt,
+    );
+  } catch (err) {
+    if (idempotencyKey && isIdempotencyUniqueViolation(err)) {
+      const existing = findMessageByIdempotencyKey(idempotencyKey);
+      if (existing) {
+        if (!isSameMessagePayload(existing, input, taskId)) {
+          throw new IdempotencyConflictError(idempotencyKey);
+        }
+        return { message: existing, created: false };
+      }
+    }
+    throw err;
+  }
+
+  return {
+    message: {
+      id,
+      sender_type: input.senderType,
+      sender_id: input.senderId,
+      receiver_type: input.receiverType,
+      receiver_id: input.receiverId,
+      content: input.content,
+      message_type: input.messageType,
+      task_id: taskId,
+      idempotency_key: idempotencyKey,
+      created_at: createdAt,
+    },
+    created: true,
+  };
+}
+
+async function insertMessageWithIdempotency(input: MessageInsertInput): Promise<{ message: StoredMessage; created: boolean }> {
+  return withSqliteBusyRetry("messages.insert", () => insertMessageWithIdempotencyOnce(input));
+}
+
 // ---------------------------------------------------------------------------
 // Schema creation
 // ---------------------------------------------------------------------------
@@ -465,6 +1012,7 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL,
   message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','directive','report','status_update')),
   task_id TEXT REFERENCES tasks(id),
+  idempotency_key TEXT,
   created_at INTEGER DEFAULT (unixepoch()*1000)
 );
 
@@ -499,6 +1047,16 @@ CREATE TABLE IF NOT EXISTS meeting_minute_entries (
   message_type TEXT NOT NULL DEFAULT 'chat',
   content TEXT NOT NULL,
   created_at INTEGER DEFAULT (unixepoch()*1000)
+);
+
+CREATE TABLE IF NOT EXISTS review_revision_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  normalized_note TEXT NOT NULL,
+  raw_note TEXT NOT NULL,
+  first_round INTEGER NOT NULL,
+  created_at INTEGER DEFAULT (unixepoch()*1000),
+  UNIQUE(task_id, normalized_note)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -581,6 +1139,7 @@ CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, created_at D
 CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_type, receiver_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_meeting_minutes_task ON meeting_minutes(task_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_meeting_minute_entries_meeting ON meeting_minute_entries(meeting_id, seq ASC);
+CREATE INDEX IF NOT EXISTS idx_review_revision_history_task ON review_revision_history(task_id, first_round DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider ON oauth_accounts(provider, status, priority, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_oauth_active_accounts_provider ON oauth_active_accounts(provider, updated_at DESC);
 `);
@@ -665,9 +1224,9 @@ function removeActiveOAuthAccount(provider: string, accountId: string): void {
 
 function setOAuthActiveAccounts(provider: string, accountIds: string[]): void {
   const cleaned = Array.from(new Set(accountIds.filter(Boolean)));
-  const run = db.transaction((ids: string[]) => {
+  runInTransaction(() => {
     db.prepare("DELETE FROM oauth_active_accounts WHERE provider = ?").run(provider);
-    if (ids.length === 0) return;
+    if (cleaned.length === 0) return;
     const stmt = db.prepare(`
       INSERT INTO oauth_active_accounts (provider, account_id, updated_at)
       VALUES (?, ?, ?)
@@ -675,12 +1234,11 @@ function setOAuthActiveAccounts(provider: string, accountIds: string[]): void {
         updated_at = excluded.updated_at
     `);
     let stamp = nowMs();
-    for (const id of ids) {
+    for (const id of cleaned) {
       stmt.run(provider, id, stamp);
       stamp += 1;
     }
   });
-  run(cleaned);
 }
 
 function ensureOAuthActiveAccount(provider: string): void {
@@ -778,6 +1336,9 @@ function migrateMessagesDirectiveType(): void {
     db.exec("BEGIN");
     try {
       db.exec(`ALTER TABLE messages RENAME TO ${oldTable}`);
+      const oldCols = db.prepare(`PRAGMA table_info(${oldTable})`).all() as Array<{ name: string }>;
+      const hasIdempotencyKey = oldCols.some((c) => c.name === "idempotency_key");
+      const idempotencyExpr = hasIdempotencyKey ? "idempotency_key" : "NULL";
       db.exec(`
         CREATE TABLE messages (
           id TEXT PRIMARY KEY,
@@ -788,12 +1349,13 @@ function migrateMessagesDirectiveType(): void {
           content TEXT NOT NULL,
           message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','directive','report','status_update')),
           task_id TEXT REFERENCES tasks(id),
+          idempotency_key TEXT,
           created_at INTEGER DEFAULT (unixepoch()*1000)
         );
       `);
       db.exec(`
-        INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at)
-        SELECT id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at
+        INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, idempotency_key, created_at)
+        SELECT id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, ${idempotencyExpr}, created_at
         FROM ${oldTable};
       `);
       db.exec(`DROP TABLE ${oldTable}`);
@@ -907,6 +1469,9 @@ function repairLegacyTaskForeignKeys(): void {
     db.exec("BEGIN");
     try {
       db.exec(`ALTER TABLE messages RENAME TO ${messagesOld}`);
+      const legacyMessageCols = db.prepare(`PRAGMA table_info(${messagesOld})`).all() as Array<{ name: string }>;
+      const hasLegacyIdempotencyKey = legacyMessageCols.some((c) => c.name === "idempotency_key");
+      const legacyIdempotencyExpr = hasLegacyIdempotencyKey ? "idempotency_key" : "NULL";
       db.exec(`
         CREATE TABLE messages (
           id TEXT PRIMARY KEY,
@@ -917,12 +1482,13 @@ function repairLegacyTaskForeignKeys(): void {
           content TEXT NOT NULL,
           message_type TEXT DEFAULT 'chat' CHECK(message_type IN ('chat','task_assign','announcement','directive','report','status_update')),
           task_id TEXT REFERENCES tasks(id),
+          idempotency_key TEXT,
           created_at INTEGER DEFAULT (unixepoch()*1000)
         );
       `);
       db.exec(`
-        INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at)
-        SELECT id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at
+        INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, idempotency_key, created_at)
+        SELECT id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, ${legacyIdempotencyExpr}, created_at
         FROM ${messagesOld};
       `);
 
@@ -1048,6 +1614,49 @@ function repairLegacyTaskForeignKeys(): void {
   }
 }
 repairLegacyTaskForeignKeys();
+
+function ensureMessagesIdempotencySchema(): void {
+  try { db.exec("ALTER TABLE messages ADD COLUMN idempotency_key TEXT"); } catch { /* already exists */ }
+
+  db.prepare(`
+    UPDATE messages
+    SET idempotency_key = NULL
+    WHERE idempotency_key IS NOT NULL
+      AND TRIM(idempotency_key) = ''
+  `).run();
+
+  const duplicateKeys = db.prepare(`
+    SELECT idempotency_key
+    FROM messages
+    WHERE idempotency_key IS NOT NULL
+    GROUP BY idempotency_key
+    HAVING COUNT(*) > 1
+  `).all() as Array<{ idempotency_key: string }>;
+
+  for (const row of duplicateKeys) {
+    const keep = db.prepare(`
+      SELECT id
+      FROM messages
+      WHERE idempotency_key = ?
+      ORDER BY created_at ASC, id ASC
+      LIMIT 1
+    `).get(row.idempotency_key) as { id: string } | undefined;
+    if (!keep) continue;
+    db.prepare(`
+      UPDATE messages
+      SET idempotency_key = NULL
+      WHERE idempotency_key = ?
+        AND id != ?
+    `).run(row.idempotency_key, keep.id);
+  }
+
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_key
+    ON messages(idempotency_key)
+    WHERE idempotency_key IS NOT NULL
+  `);
+}
+ensureMessagesIdempotencySchema();
 
 // ---------------------------------------------------------------------------
 // Seed default data
@@ -1191,11 +1800,7 @@ const stopRequestedTasks = new Set<string>();
 const stopRequestModeByTask = new Map<string, "pause" | "cancel">();
 
 function readTimeoutMsEnv(name: string, fallbackMs: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallbackMs;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) return fallbackMs;
-  return Math.floor(parsed);
+  return readNonNegativeIntEnv(name, fallbackMs);
 }
 
 const TASK_RUN_IDLE_TIMEOUT_MS = readTimeoutMsEnv("TASK_RUN_IDLE_TIMEOUT_MS", 8 * 60_000);
@@ -1411,6 +2016,353 @@ function getWorktreeDiffSummary(projectPath: string, taskId: string): string {
   }
 }
 
+const MVP_CODE_REVIEW_POLICY_BASE_LINES = [
+  "[MVP Code Review Policy / 코드 리뷰 정책]",
+  "- CRITICAL/HIGH: fix immediately / 즉시 수정",
+  "- MEDIUM/LOW: warning report only, no code changes / 경고 보고서만, 코드 수정 금지",
+];
+
+const WARNING_FIX_OVERRIDE_LINE = "- Exception override: User explicitly requested warning-level fixes for this task. You may fix the requested MEDIUM/LOW items / 예외: 이 작업에서 사용자 요청 시 MEDIUM/LOW도 해당 요청 범위 내에서 수정 가능";
+
+function hasExplicitWarningFixRequest(...textParts: Array<string | null | undefined>): boolean {
+  const text = textParts.filter((part): part is string => typeof part === "string" && part.trim().length > 0).join("\n");
+  if (!text) return false;
+  if (/\[(ALLOW_WARNING_FIX|WARN_FIX)\]/i.test(text)) return true;
+
+  const requestHint = /\b(please|can you|need to|must|should|fix this|fix these|resolve this|address this|fix requested|warning fix)\b|해줘|해주세요|수정해|수정해야|고쳐|고쳐줘|해결해|반영해|조치해|수정 요청/i;
+  if (!requestHint.test(text)) return false;
+
+  const warningFixPair = /\b(fix|resolve|address|patch|remediate|correct)\b[\s\S]{0,60}\b(warning|warnings|medium|low|minor|non-critical|lint)\b|\b(warning|warnings|medium|low|minor|non-critical|lint)\b[\s\S]{0,60}\b(fix|resolve|address|patch|remediate|correct)\b|(?:경고|워닝|미디엄|로우|마이너|사소|비치명|린트)[\s\S]{0,40}(?:수정|고쳐|해결|반영|조치)|(?:수정|고쳐|해결|반영|조치)[\s\S]{0,40}(?:경고|워닝|미디엄|로우|마이너|사소|비치명|린트)/i;
+  return warningFixPair.test(text);
+}
+
+function buildMvpCodeReviewPolicyBlock(allowWarningFix: boolean): string {
+  const lines = [...MVP_CODE_REVIEW_POLICY_BASE_LINES];
+  if (allowWarningFix) lines.push(WARNING_FIX_OVERRIDE_LINE);
+  return lines.join("\n");
+}
+
+function buildTaskExecutionPrompt(
+  parts: Array<string | null | undefined>,
+  opts: { allowWarningFix?: boolean } = {},
+): string {
+  return [...parts, buildMvpCodeReviewPolicyBlock(Boolean(opts.allowWarningFix))].filter(Boolean).join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Project context generation (token-saving: static analysis, cached by git HEAD)
+// ---------------------------------------------------------------------------
+
+const CONTEXT_IGNORE_DIRS = new Set([
+  "node_modules", "dist", "build", ".next", ".nuxt", "out", "__pycache__",
+  ".git", ".climpire-worktrees", ".climpire", "vendor", ".venv", "venv",
+  "coverage", ".cache", ".turbo", ".parcel-cache", "target", "bin", "obj",
+]);
+
+const CONTEXT_IGNORE_FILES = new Set([
+  "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+  ".DS_Store", "Thumbs.db",
+]);
+
+function buildFileTree(dir: string, prefix = "", depth = 0, maxDepth = 4): string[] {
+  if (depth >= maxDepth) return [`${prefix}...`];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  entries = entries
+    .filter(e => !e.isSymbolicLink())
+    .filter(e => !e.name.startsWith(".") || e.name === ".env.example")
+    .filter(e => !CONTEXT_IGNORE_DIRS.has(e.name) && !CONTEXT_IGNORE_FILES.has(e.name))
+    .sort((a, b) => {
+      if (a.isDirectory() && !b.isDirectory()) return -1;
+      if (!a.isDirectory() && b.isDirectory()) return 1;
+      return a.name.localeCompare(b.name);
+    });
+
+  const lines: string[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const isLast = i === entries.length - 1;
+    const connector = isLast ? "└── " : "├── ";
+    const childPrefix = isLast ? "    " : "│   ";
+    if (e.isDirectory()) {
+      lines.push(`${prefix}${connector}${e.name}/`);
+      lines.push(...buildFileTree(path.join(dir, e.name), prefix + childPrefix, depth + 1, maxDepth));
+    } else {
+      lines.push(`${prefix}${connector}${e.name}`);
+    }
+  }
+  return lines;
+}
+
+function detectTechStack(projectPath: string): string[] {
+  const stack: string[] = [];
+  try {
+    const pkgPath = path.join(projectPath, "package.json");
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+      const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+      const sv = (v: unknown) => String(v ?? "").replace(/[\n\r]/g, "").slice(0, 20);
+      if (allDeps.react) stack.push(`React ${sv(allDeps.react)}`);
+      if (allDeps.next) stack.push(`Next.js ${sv(allDeps.next)}`);
+      if (allDeps.vue) stack.push(`Vue ${sv(allDeps.vue)}`);
+      if (allDeps.svelte) stack.push("Svelte");
+      if (allDeps.express) stack.push("Express");
+      if (allDeps.fastify) stack.push("Fastify");
+      if (allDeps.typescript) stack.push("TypeScript");
+      if (allDeps.tailwindcss) stack.push("Tailwind CSS");
+      if (allDeps.vite) stack.push("Vite");
+      if (allDeps.webpack) stack.push("Webpack");
+      if (allDeps.prisma || allDeps["@prisma/client"]) stack.push("Prisma");
+      if (allDeps.drizzle) stack.push("Drizzle");
+      const runtime = pkg.engines?.node ? `Node.js ${sv(pkg.engines.node)}` : "Node.js";
+      if (!stack.some(s => s.startsWith("Node"))) stack.unshift(runtime);
+    }
+  } catch { /* ignore parse errors */ }
+  try { if (fs.existsSync(path.join(projectPath, "requirements.txt"))) stack.push("Python"); } catch {}
+  try { if (fs.existsSync(path.join(projectPath, "go.mod"))) stack.push("Go"); } catch {}
+  try { if (fs.existsSync(path.join(projectPath, "Cargo.toml"))) stack.push("Rust"); } catch {}
+  try { if (fs.existsSync(path.join(projectPath, "pom.xml"))) stack.push("Java (Maven)"); } catch {}
+  try { if (fs.existsSync(path.join(projectPath, "build.gradle")) || fs.existsSync(path.join(projectPath, "build.gradle.kts"))) stack.push("Java (Gradle)"); } catch {}
+  return stack;
+}
+
+function getKeyFiles(projectPath: string): string[] {
+  const keyPatterns = [
+    "package.json", "tsconfig.json", "vite.config.ts", "vite.config.js",
+    "next.config.js", "next.config.ts", "webpack.config.js",
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    ".env.example", "Makefile", "CMakeLists.txt",
+  ];
+  const result: string[] = [];
+
+  // Key config files
+  for (const p of keyPatterns) {
+    const fullPath = path.join(projectPath, p);
+    try {
+      if (fs.existsSync(fullPath)) {
+        const stat = fs.statSync(fullPath);
+        result.push(`${p} (${stat.size} bytes)`);
+      }
+    } catch {}
+  }
+
+  // Key source directories - count files
+  const srcDirs = ["src", "server", "app", "lib", "pages", "components", "api"];
+  for (const d of srcDirs) {
+    const dirPath = path.join(projectPath, d);
+    try {
+      if (fs.statSync(dirPath).isDirectory()) {
+        let count = 0;
+        const countFiles = (dir: string, depth = 0) => {
+          if (depth > 10) return;
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const e of entries) {
+            if (CONTEXT_IGNORE_DIRS.has(e.name) || e.isSymbolicLink()) continue;
+            if (e.isDirectory()) countFiles(path.join(dir, e.name), depth + 1);
+            else count++;
+          }
+        };
+        countFiles(dirPath);
+        result.push(`${d}/ (${count} files)`);
+      }
+    } catch {}
+  }
+
+  return result;
+}
+
+function generateProjectContext(projectPath: string): string {
+  const climpireDir = path.join(projectPath, ".climpire");
+  const contextPath = path.join(climpireDir, "project-context.md");
+  const metaPath = path.join(climpireDir, "project-context.meta");
+
+  // Cache check: compare git HEAD
+  if (isGitRepo(projectPath)) {
+    try {
+      const currentHead = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: projectPath, stdio: "pipe", timeout: 5000,
+      }).toString().trim();
+
+      if (fs.existsSync(metaPath) && fs.existsSync(contextPath)) {
+        const cachedHead = fs.readFileSync(metaPath, "utf8").trim();
+        if (cachedHead === currentHead) {
+          return fs.readFileSync(contextPath, "utf8");
+        }
+      }
+
+      // Generate fresh context
+      const content = buildProjectContextContent(projectPath);
+
+      // Write cache
+      fs.mkdirSync(climpireDir, { recursive: true });
+      fs.writeFileSync(contextPath, content, "utf8");
+      fs.writeFileSync(metaPath, currentHead, "utf8");
+      console.log(`[Claw-Empire] Generated project context: ${contextPath}`);
+      return content;
+    } catch (err) {
+      console.warn(`[Claw-Empire] Failed to generate project context: ${err}`);
+    }
+  }
+
+  // Non-git project: TTL-based caching (5 minutes)
+  try {
+    if (fs.existsSync(contextPath)) {
+      const stat = fs.statSync(contextPath);
+      if (Date.now() - stat.mtimeMs < 5 * 60 * 1000) {
+        return fs.readFileSync(contextPath, "utf8");
+      }
+    }
+    const content = buildProjectContextContent(projectPath);
+    fs.mkdirSync(climpireDir, { recursive: true });
+    fs.writeFileSync(contextPath, content, "utf8");
+    return content;
+  } catch {
+    return "";
+  }
+}
+
+function buildProjectContextContent(projectPath: string): string {
+  const sections: string[] = [];
+  const projectName = path.basename(projectPath);
+
+  sections.push(`# Project: ${projectName}\n`);
+
+  // Tech stack
+  const techStack = detectTechStack(projectPath);
+  if (techStack.length) {
+    sections.push(`## Tech Stack\n${techStack.join(", ")}\n`);
+  }
+
+  // File tree
+  const tree = buildFileTree(projectPath);
+  if (tree.length) {
+    sections.push(`## File Structure\n\`\`\`\n${tree.join("\n")}\n\`\`\`\n`);
+  }
+
+  // Key files
+  const keyFiles = getKeyFiles(projectPath);
+  if (keyFiles.length) {
+    sections.push(`## Key Files\n${keyFiles.map(f => `- ${f}`).join("\n")}\n`);
+  }
+
+  // README excerpt
+  for (const readmeName of ["README.md", "readme.md", "README.rst"]) {
+    const readmePath = path.join(projectPath, readmeName);
+    try {
+      if (fs.existsSync(readmePath)) {
+        const lines = fs.readFileSync(readmePath, "utf8").split("\n").slice(0, 20);
+        sections.push(`## README (first 20 lines)\n${lines.join("\n")}\n`);
+        break;
+      }
+    } catch {}
+  }
+
+  return sections.join("\n");
+}
+
+function getRecentChanges(projectPath: string, taskId: string): string {
+  const parts: string[] = [];
+
+  // 1. Recent commits (git log --oneline -10)
+  if (isGitRepo(projectPath)) {
+    try {
+      const log = execFileSync("git", ["log", "--oneline", "-10"], {
+        cwd: projectPath, stdio: "pipe", timeout: 5000,
+      }).toString().trim();
+      if (log) parts.push(`### Recent Commits\n${log}`);
+    } catch {}
+
+    // 2. Active worktree branch diff stats
+    try {
+      const worktreeList = execFileSync("git", ["worktree", "list", "--porcelain"], {
+        cwd: projectPath, stdio: "pipe", timeout: 5000,
+      }).toString().trim();
+
+      const currentBranch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+        cwd: projectPath, stdio: "pipe", timeout: 5000,
+      }).toString().trim();
+
+      const worktreeLines: string[] = [];
+      const blocks = worktreeList.split("\n\n");
+      for (const block of blocks) {
+        const branchMatch = block.match(/branch refs\/heads\/(climpire\/[^\s]+)/);
+        if (branchMatch) {
+          const branch = branchMatch[1];
+          try {
+            const stat = execFileSync("git", ["diff", `${currentBranch}...${branch}`, "--stat", "--stat-width=60"], {
+              cwd: projectPath, stdio: "pipe", timeout: 5000,
+            }).toString().trim();
+            if (stat) worktreeLines.push(`  ${branch}:\n${stat}`);
+          } catch {}
+        }
+      }
+      if (worktreeLines.length) {
+        parts.push(`### Active Worktree Changes (other agents)\n${worktreeLines.join("\n")}`);
+      }
+    } catch {}
+  }
+
+  // 3. Recently completed tasks for this project
+  try {
+    const recentTasks = db.prepare(`
+      SELECT t.id, t.title, a.name AS agent_name, t.updated_at FROM tasks t
+      LEFT JOIN agents a ON t.assigned_agent_id = a.id
+      WHERE t.project_path = ? AND t.status = 'done' AND t.id != ?
+      ORDER BY t.updated_at DESC LIMIT 3
+    `).all(projectPath, taskId) as Array<{
+      id: string; title: string; agent_name: string | null; updated_at: number;
+    }>;
+
+    if (recentTasks.length) {
+      const taskLines = recentTasks.map(t => `- ${t.title} (by ${t.agent_name || "unknown"})`);
+      parts.push(`### Recently Completed Tasks\n${taskLines.join("\n")}`);
+    }
+  } catch {}
+
+  if (!parts.length) return "";
+  return parts.join("\n\n");
+}
+
+function ensureClaudeMd(projectPath: string, worktreePath: string): void {
+  // Don't touch projects that already have CLAUDE.md
+  if (fs.existsSync(path.join(projectPath, "CLAUDE.md"))) return;
+
+  const climpireDir = path.join(projectPath, ".climpire");
+  const claudeMdSrc = path.join(climpireDir, "CLAUDE.md");
+  const claudeMdDst = path.join(worktreePath, "CLAUDE.md");
+
+  // Generate abbreviated CLAUDE.md if not cached
+  if (!fs.existsSync(claudeMdSrc)) {
+    const techStack = detectTechStack(projectPath);
+    const keyFiles = getKeyFiles(projectPath);
+    const projectName = path.basename(projectPath);
+
+    const content = [
+      `# ${projectName}`,
+      "",
+      techStack.length ? `**Stack:** ${techStack.join(", ")}` : "",
+      "",
+      keyFiles.length ? `**Key files:** ${keyFiles.slice(0, 10).join(", ")}` : "",
+      "",
+      "This file was auto-generated by Claw Empire to provide project context.",
+    ].filter(Boolean).join("\n");
+
+    fs.mkdirSync(climpireDir, { recursive: true });
+    fs.writeFileSync(claudeMdSrc, content, "utf8");
+    console.log(`[Claw-Empire] Generated CLAUDE.md: ${claudeMdSrc}`);
+  }
+  // Copy to worktree root
+  try {
+    fs.copyFileSync(claudeMdSrc, claudeMdDst);
+  } catch (err) {
+    console.warn(`[Claw-Empire] Failed to copy CLAUDE.md to worktree: ${err}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket setup
 // ---------------------------------------------------------------------------
@@ -1442,6 +2394,7 @@ function buildAgentArgs(provider: string, model?: string, reasoningLevel?: strin
         "claude",
         "--dangerously-skip-permissions",
         "--print",
+        "--verbose",
         "--output-format=stream-json",
         "--include-partial-messages",
       ];
@@ -1533,6 +2486,7 @@ function getRecentConversationContext(agentId: string, limit = 10): string {
 }
 
 interface MeetingTranscriptEntry {
+  speaker_agent_id?: string;
   speaker: string;
   department: string;
   role: string;
@@ -1701,9 +2655,35 @@ function summarizeForMeetingBubble(text: string, maxChars = 96, lang: Lang = get
   return `${cleaned.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
+function isMvpDeferralSignal(text: string): boolean {
+  return /mvp|범위\s*초과|실환경|프로덕션|production|post[-\s]?merge|post[-\s]?release|안정화\s*단계|stabilization|모니터링|monitoring|sla|체크리스트|checklist|문서화|runbook|후속\s*(개선|처리|모니터링)|defer|deferred|later\s*phase|다음\s*단계|배포\s*후/i
+    .test(text);
+}
+
+function isHardBlockSignal(text: string): boolean {
+  return /최종\s*승인\s*불가|배포\s*불가|절대\s*불가|중단|즉시\s*중단|반려|cannot\s+(approve|ship|release)|must\s+fix\s+before|hard\s+blocker|critical\s+blocker|p0|data\s+loss|security\s+incident|integrity\s+broken|audit\s*fail|build\s*fail|무결성\s*(훼손|깨짐)|데이터\s*손실|보안\s*사고|치명/i
+    .test(text);
+}
+
+function hasApprovalAgreementSignal(text: string): boolean {
+  return /승인|approve|approved|동의|agree|agreed|lgtm|go\s+ahead|merge\s+approve|병합\s*승인|전환\s*동의|조건부\s*승인/i
+    .test(text);
+}
+
+function isDeferrableReviewHold(text: string): boolean {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return false;
+  if (!isMvpDeferralSignal(cleaned)) return false;
+  if (isHardBlockSignal(cleaned)) return false;
+  return true;
+}
+
 function classifyMeetingReviewDecision(text: string): MeetingReviewDecision {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) return "reviewing";
+  const hasApprovalAgreement = hasApprovalAgreementSignal(cleaned);
+  const hasMvpDeferral = isMvpDeferralSignal(cleaned);
+  const hasHardBlock = isHardBlockSignal(cleaned);
   const hasApprovalSignal = /(승인|통과|문제없|진행.?가능|배포.?가능|approve|approved|lgtm|ship\s+it|go\s+ahead|承認|批准|通过|可发布)/i
     .test(cleaned);
   const hasNoRiskSignal = /(리스크\s*(없|없음|없습니다|없는|없이)|위험\s*(없|없음|없습니다|없는|없이)|문제\s*없|이슈\s*없|no\s+risk|without\s+risk|risk[-\s]?free|no\s+issue|no\s+blocker|リスク(は)?(ありません|なし|無し)|問題ありません|无风险|没有风险|無風險|无问题)/i
@@ -1713,13 +2693,30 @@ function classifyMeetingReviewDecision(text: string): MeetingReviewDecision {
 
   // "No risk / no issue + approval" should not be downgraded to hold.
   if (hasApprovalSignal && hasNoRiskSignal) return "approved";
-  if (hasConditionalOrHoldSignal) return "hold";
-  if (hasApprovalSignal || hasNoRiskSignal) return "approved";
+  if ((hasApprovalAgreement || hasApprovalSignal) && hasMvpDeferral && !hasHardBlock) return "approved";
+  if (hasConditionalOrHoldSignal) {
+    if ((hasApprovalAgreement || hasApprovalSignal) && hasMvpDeferral && !hasHardBlock) return "approved";
+    return "hold";
+  }
+  if (hasApprovalSignal || hasNoRiskSignal || hasApprovalAgreement) return "approved";
   return "reviewing";
 }
 
 function wantsReviewRevision(content: string): boolean {
   return classifyMeetingReviewDecision(content) === "hold";
+}
+
+function findLatestTranscriptContentByAgent(
+  transcript: MeetingTranscriptEntry[],
+  agentId: string,
+): string {
+  for (let i = transcript.length - 1; i >= 0; i -= 1) {
+    const row = transcript[i];
+    if (row.speaker_agent_id === agentId) {
+      return row.content;
+    }
+  }
+  return "";
 }
 
 function formatMeetingTranscript(transcript: MeetingTranscriptEntry[]): string {
@@ -3887,7 +4884,7 @@ function getAllActiveTeamLeaders(): AgentRow[] {
     LEFT JOIN departments d ON a.department_id = d.id
     WHERE a.role = 'team_leader' AND a.status != 'offline'
     ORDER BY d.sort_order ASC, a.name ASC
-  `).all() as AgentRow[];
+  `).all() as unknown as AgentRow[];
 }
 
 function getTaskRelatedDepartmentIds(taskId: string, fallbackDeptId: string | null): string[] {
@@ -4023,9 +5020,79 @@ function finishMeetingMinutes(
   ).run(status, nowMs(), meetingId);
 }
 
-function collectRevisionMemoItems(transcript: MeetingTranscriptEntry[], maxItems = 8): string[] {
+function normalizeRevisionMemoNote(note: string): string {
+  const trimmed = note
+    .replace(/\s+/g, " ")
+    .replace(/^[\s\-*0-9.)]+/, "")
+    .trim()
+    .toLowerCase();
+  const withoutPrefix = trimmed.replace(/^[^:]{1,80}:\s*/, "");
+  const normalized = withoutPrefix
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized || withoutPrefix || trimmed;
+}
+
+function reserveReviewRevisionMemoItems(
+  taskId: string,
+  round: number,
+  memoItems: string[],
+): { freshItems: string[]; duplicateCount: number } {
+  if (memoItems.length === 0) return { freshItems: [], duplicateCount: 0 };
+  const now = nowMs();
+  const freshItems: string[] = [];
+  let duplicateCount = 0;
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO review_revision_history
+      (task_id, normalized_note, raw_note, first_round, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  for (const raw of memoItems) {
+    const note = raw.replace(/\s+/g, " ").trim();
+    if (!note) continue;
+    const normalized = normalizeRevisionMemoNote(note);
+    if (!normalized) continue;
+    const result = insert.run(taskId, normalized, note, round, now) as { changes?: number } | undefined;
+    if ((result?.changes ?? 0) > 0) {
+      freshItems.push(note);
+    } else {
+      duplicateCount += 1;
+    }
+  }
+  return { freshItems, duplicateCount };
+}
+
+function loadRecentReviewRevisionMemoItems(taskId: string, maxItems = 4): string[] {
+  const rows = db.prepare(`
+    SELECT raw_note
+    FROM review_revision_history
+    WHERE task_id = ?
+    ORDER BY first_round DESC, id DESC
+    LIMIT ?
+  `).all(taskId, maxItems) as Array<{ raw_note: string }>;
   const out: string[] = [];
   const seen = new Set<string>();
+  for (const row of rows) {
+    const note = row.raw_note.replace(/\s+/g, " ").trim();
+    if (!note) continue;
+    const key = note.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(note);
+  }
+  return out;
+}
+
+function collectRevisionMemoItems(
+  transcript: MeetingTranscriptEntry[],
+  maxItems = REVIEW_MAX_MEMO_ITEMS_PER_ROUND,
+  maxPerDepartment = REVIEW_MAX_MEMO_ITEMS_PER_DEPT,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const perDept = new Map<string, number>();
   const isIssue = (text: string) => (
     /보완|보류|리스크|미첨부|미구축|미완료|불가|부족|0%|hold|revise|revision|required|pending|risk|block|missing|not attached|incomplete|保留|修正|补充|未完成|未附|风险/i
   ).test(text);
@@ -4033,10 +5100,14 @@ function collectRevisionMemoItems(transcript: MeetingTranscriptEntry[], maxItems
   for (const row of transcript) {
     const base = row.content.replace(/\s+/g, " ").trim();
     if (!base || !isIssue(base)) continue;
+    const deptKey = row.department.replace(/\s+/g, " ").trim().toLowerCase() || "unknown";
+    const deptCount = perDept.get(deptKey) ?? 0;
+    if (deptCount >= maxPerDepartment) continue;
     const note = `${row.department} ${row.speaker}: ${base}`;
-    const normalized = note.toLowerCase();
+    const normalized = normalizeRevisionMemoNote(note);
     if (seen.has(normalized)) continue;
     seen.add(normalized);
+    perDept.set(deptKey, deptCount + 1);
     out.push(note.length > 220 ? `${note.slice(0, 219).trimEnd()}…` : note);
     if (out.length >= maxItems) break;
   }
@@ -4225,17 +5296,35 @@ function startReviewConsensusMeeting(
       return;
     }
     try {
-      const existingMeeting = db.prepare(`
-        SELECT id, round
+      const latestMeeting = db.prepare(`
+        SELECT id, round, status
         FROM meeting_minutes
         WHERE task_id = ?
           AND meeting_type = 'review'
-          AND status = 'in_progress'
         ORDER BY started_at DESC, created_at DESC
         LIMIT 1
-      `).get(taskId) as { id: string; round: number } | undefined;
-      const round = existingMeeting?.round ?? 1;
+      `).get(taskId) as { id: string; round: number; status: string } | undefined;
+      const resumeMeeting = latestMeeting?.status === "in_progress";
+      const round = resumeMeeting ? (latestMeeting?.round ?? 1) : ((latestMeeting?.round ?? 0) + 1);
       reviewRoundState.set(taskId, round);
+      if (!resumeMeeting && round > REVIEW_MAX_ROUNDS) {
+        const cappedLang = resolveLang(taskTitle);
+        appendTaskLog(
+          taskId,
+          "system",
+          `Review round ${round} exceeds max_rounds=${REVIEW_MAX_ROUNDS}; forcing final decision`,
+        );
+        notifyCeo(pickL(l(
+          [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드가 최대치(${REVIEW_MAX_ROUNDS})를 초과해 추가 보완은 중단하고 최종 승인 판단으로 전환합니다.`],
+          [`[CEO OFFICE] '${taskTitle}' exceeded max review rounds (${REVIEW_MAX_ROUNDS}). Additional revision rounds are closed and we are moving to final approval decision.`],
+          [`[CEO OFFICE] '${taskTitle}' はレビュー上限(${REVIEW_MAX_ROUNDS}回)を超えたため、追加補完を停止して最終承認判断へ移行します。`],
+          [`[CEO OFFICE] '${taskTitle}' 的评审轮次已超过上限（${REVIEW_MAX_ROUNDS}）。现停止追加整改并转入最终审批判断。`],
+        ), cappedLang), taskId);
+        reviewRoundState.delete(taskId);
+        reviewInFlight.delete(taskId);
+        onApproved();
+        return;
+      }
 
       const planningLeader = leaders.find((l) => l.department_id === "planning") ?? leaders[0];
       const otherLeaders = leaders.filter((l) => l.id !== planningLeader.id);
@@ -4255,7 +5344,9 @@ function startReviewConsensusMeeting(
       const lang = resolveLang(taskDescription ?? taskTitle);
       const transcript: MeetingTranscriptEntry[] = [];
       const oneShotOptions = { projectPath, timeoutMs: 35_000 };
-      meetingId = existingMeeting?.id ?? beginMeetingMinutes(taskId, "review", round, taskTitle);
+      meetingId = resumeMeeting
+        ? (latestMeeting?.id ?? null)
+        : beginMeetingMinutes(taskId, "review", round, taskTitle);
       let minuteSeq = 1;
       if (meetingId) {
         const seqRow = db.prepare(
@@ -4277,6 +5368,7 @@ function startReviewConsensusMeeting(
 
       const pushTranscript = (leader: AgentRow, content: string) => {
         transcript.push({
+          speaker_agent_id: leader.id,
           speaker: getAgentDisplayName(leader, lang),
           department: getDeptName(leader.department_id ?? ""),
           role: getRoleLabel(leader.role, lang as Lang),
@@ -4296,7 +5388,7 @@ function startReviewConsensusMeeting(
 
       if (abortIfInactive()) return;
       callLeadersToCeoOffice(taskId, leaders, "review");
-      notifyCeo(existingMeeting
+      notifyCeo(resumeMeeting
         ? pickL(l(
           [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 ${round} 재개. 팀장 의견 수집 및 상호 승인 재진행합니다.`],
           [`[CEO OFFICE] '${taskTitle}' review round ${round} resumed. Continuing team-lead feedback and mutual approvals.`],
@@ -4423,32 +5515,127 @@ function startReviewConsensusMeeting(
 
       // Final review result should follow each leader's last approval statement,
       // not stale "needs revision" flags from earlier feedback turns.
-      const finalHoldLeaders = leaders.filter(
-        (leader) => meetingReviewDecisionByAgent.get(leader.id) === "hold"
-      );
+      const finalHoldLeaders: AgentRow[] = [];
+      const deferredMonitoringLeaders: AgentRow[] = [];
+      const deferredMonitoringNotes: string[] = [];
+      const finalHoldDeptCount = new Map<string, number>();
+      for (const leader of leaders) {
+        if (meetingReviewDecisionByAgent.get(leader.id) !== "hold") continue;
+        const latestDecisionLine = findLatestTranscriptContentByAgent(transcript, leader.id);
+        if (isDeferrableReviewHold(latestDecisionLine)) {
+          const clipped = summarizeForMeetingBubble(latestDecisionLine, 160);
+          deferredMonitoringLeaders.push(leader);
+          deferredMonitoringNotes.push(
+            `${getDeptName(leader.department_id ?? "")} ${getAgentDisplayName(leader, lang)}: ${clipped}`,
+          );
+          appendTaskLog(
+            taskId,
+            "system",
+            `Review round ${round}: converted deferrable hold to post-merge monitoring (${leader.id})`,
+          );
+          continue;
+        }
+        if (finalHoldLeaders.length >= REVIEW_MAX_REVISION_SIGNALS_PER_ROUND) {
+          appendTaskLog(
+            taskId,
+            "system",
+            `Review round ${round}: hold signal ignored (round cap ${REVIEW_MAX_REVISION_SIGNALS_PER_ROUND})`,
+          );
+          continue;
+        }
+        const deptKey = leader.department_id ?? `agent:${leader.id}`;
+        const deptCount = finalHoldDeptCount.get(deptKey) ?? 0;
+        if (deptCount >= REVIEW_MAX_REVISION_SIGNALS_PER_DEPT_PER_ROUND) {
+          appendTaskLog(
+            taskId,
+            "system",
+            `Review round ${round}: hold signal ignored for dept ${deptKey} (dept cap ${REVIEW_MAX_REVISION_SIGNALS_PER_DEPT_PER_ROUND})`,
+          );
+          continue;
+        }
+        finalHoldDeptCount.set(deptKey, deptCount + 1);
+        finalHoldLeaders.push(leader);
+      }
       needsRevision = finalHoldLeaders.length > 0;
       if (needsRevision && !reviseOwner) {
         reviseOwner = finalHoldLeaders[0] ?? null;
+      }
+      if (!needsRevision && deferredMonitoringNotes.length > 0) {
+        appendTaskProjectMemo(taskId, "review", round, deferredMonitoringNotes, lang);
+        appendTaskLog(
+          taskId,
+          "system",
+          `Review round ${round}: deferred ${deferredMonitoringLeaders.length} hold opinions to SLA monitoring checklist`,
+        );
       }
 
       await sleepMs(randomDelay(540, 920));
       if (abortIfInactive()) return;
 
       if (needsRevision) {
-        appendTaskLog(taskId, "system", `Review consensus round ${round}: revision requested`);
-        const memoItems = collectRevisionMemoItems(transcript);
-        appendTaskProjectMemo(taskId, "review", round, memoItems, lang);
-        const revisionSubtaskCount = seedReviewRevisionSubtasks(taskId, departmentId, memoItems);
+        const rawMemoItems = collectRevisionMemoItems(
+          transcript,
+          REVIEW_MAX_MEMO_ITEMS_PER_ROUND,
+          REVIEW_MAX_MEMO_ITEMS_PER_DEPT,
+        );
+        const { freshItems, duplicateCount } = reserveReviewRevisionMemoItems(taskId, round, rawMemoItems);
+        const hasFreshMemoItems = freshItems.length > 0;
+        const fallbackMemoItem = pickL(l(
+          ["리뷰 보완 요청이 감지되었습니다. 합의된 품질 기준과 증빙을 기준으로 잔여 리스크를 문서화하고 최종 결정이 필요합니다."],
+          ["A review hold signal was detected. Document residual risks against agreed quality gates and move to a final decision."],
+          ["レビュー保留シグナルを検知しました。合意した品質基準に対する残余リスクを文書化し、最終判断へ進めてください。"],
+          ["检测到评审保留信号。请基于既定质量门槛记录剩余风险，并进入最终决策。"],
+        ), lang);
+        const memoItemsForAction = hasFreshMemoItems ? freshItems : [fallbackMemoItem];
+        const recentMemoItems = hasFreshMemoItems ? [] : loadRecentReviewRevisionMemoItems(taskId, 4);
+        const memoItemsForProject = hasFreshMemoItems
+          ? freshItems
+          : (recentMemoItems.length > 0 ? recentMemoItems : memoItemsForAction);
+        appendTaskProjectMemo(taskId, "review", round, memoItemsForProject, lang);
+
+        const reachedRoundLimit = round >= REVIEW_MAX_ROUNDS;
+        const noNewBlockersAfterRetry = !hasFreshMemoItems && round >= 2;
+        appendTaskLog(
+          taskId,
+          "system",
+          `Review consensus round ${round}: revision requested `
+          + `(new_items=${freshItems.length}, duplicates=${duplicateCount}, round_limit=${reachedRoundLimit ? "yes" : "no"})`,
+        );
+
+        if (reachedRoundLimit || noNewBlockersAfterRetry) {
+          const forceReason = reachedRoundLimit
+            ? `round_limit(${REVIEW_MAX_ROUNDS})`
+            : "no_new_blockers_after_retry";
+          appendTaskLog(
+            taskId,
+            "system",
+            `Review consensus round ${round}: forcing final decision with documented residual risk (${forceReason})`,
+          );
+          notifyCeo(pickL(l(
+            [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 ${round}에서 잔여 리스크를 프로젝트 메모로 문서화했고, 추가 보완 라운드는 제한되어 최종 승인 판단으로 전환합니다.`],
+            [`[CEO OFFICE] In review round ${round} for '${taskTitle}', residual risks were documented in the project memo and additional revision rounds are capped. Switching to final approval decision.`],
+            [`[CEO OFFICE] '${taskTitle}' のレビューラウンド${round}で残余リスクをプロジェクトメモに記録しました。追加補完ラウンドは上限に達したため、最終承認判断へ移行します。`],
+            [`[CEO OFFICE] '${taskTitle}' 在第 ${round} 轮 Review 已将剩余风险记录到项目备忘录。由于补充轮次受限，现转入最终审批判断。`],
+          ), lang), taskId);
+          if (meetingId) finishMeetingMinutes(meetingId, "completed");
+          dismissLeadersFromCeoOffice(taskId, leaders);
+          reviewRoundState.delete(taskId);
+          reviewInFlight.delete(taskId);
+          onApproved();
+          return;
+        }
+
+        const revisionSubtaskCount = seedReviewRevisionSubtasks(taskId, departmentId, memoItemsForAction);
         appendTaskLog(
           taskId,
           "system",
           `Review consensus round ${round}: revision subtasks queued (${revisionSubtaskCount})`,
         );
         notifyCeo(pickL(l(
-          [`[CEO OFFICE] '${taskTitle}' 1차 Review에서 승인 보류/조건부 승인으로 판단되었습니다. 보완 SubTask ${revisionSubtaskCount}건을 생성해 즉시 반영 단계로 전환합니다.`],
-          [`[CEO OFFICE] '${taskTitle}' ended as hold/conditional in the first review. Created ${revisionSubtaskCount} revision subtasks and switching immediately to remediation.`],
-          [`[CEO OFFICE] '${taskTitle}' は1回目のReviewで保留/条件付き承認となりました。補完SubTaskを${revisionSubtaskCount}件作成し、即時に反映フェーズへ移行します。`],
-          [`[CEO OFFICE] '${taskTitle}' 在第1轮 Review 被判定为保留/条件批准。已创建 ${revisionSubtaskCount} 个整改 SubTask，并立即转入整改执行阶段。`],
+          [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 ${round}는 조건부/보류 판정입니다. 보완 SubTask ${revisionSubtaskCount}건을 생성해 즉시 반영 단계로 전환합니다.`],
+          [`[CEO OFFICE] Review round ${round} for '${taskTitle}' is hold/conditional. Created ${revisionSubtaskCount} revision subtasks and switching immediately to remediation.`],
+          [`[CEO OFFICE] '${taskTitle}' のレビューラウンド${round}は保留/条件付き承認です。補完SubTaskを${revisionSubtaskCount}件作成し、即時に反映フェーズへ移行します。`],
+          [`[CEO OFFICE] '${taskTitle}' 第${round}轮 Review 判定为保留/条件批准。已创建 ${revisionSubtaskCount} 个整改 SubTask，并立即转入整改执行阶段。`],
         ), lang), taskId);
 
         if (meetingId) finishMeetingMinutes(meetingId, "revision_requested");
@@ -4492,6 +5679,15 @@ function startReviewConsensusMeeting(
         const execDeptName = execDeptId ? getDeptName(execDeptId) : "Unassigned";
         startTaskExecutionForAgent(taskId, execAgent, execDeptId, execDeptName);
         return;
+      }
+
+      if (deferredMonitoringLeaders.length > 0) {
+        notifyCeo(pickL(l(
+          [`[CEO OFFICE] '${taskTitle}' 리뷰 라운드 ${round}에서 ${deferredMonitoringLeaders.length}개 보류 의견이 'MVP 범위 외 항목의 SLA 모니터링 전환'으로 분류되어 코드 병합 후 후속 체크리스트로 이관합니다.`],
+          [`[CEO OFFICE] In review round ${round} for '${taskTitle}', ${deferredMonitoringLeaders.length} hold opinions were classified as MVP-out-of-scope and moved to post-merge SLA monitoring checklist.`],
+          [`[CEO OFFICE] '${taskTitle}' のレビューラウンド${round}では、保留意見${deferredMonitoringLeaders.length}件を「MVP範囲外のSLA監視項目」へ振替し、コード統合後のチェックリストで追跡します。`],
+          [`[CEO OFFICE] '${taskTitle}' 第${round}轮 Review 中，有 ${deferredMonitoringLeaders.length} 条保留意见被判定为 MVP 范围外事项，已转入合并后的 SLA 监控清单跟踪。`],
+        ), lang), taskId);
       }
 
       appendTaskLog(taskId, "system", `Review consensus round ${round}: all leaders approved`);
@@ -4562,7 +5758,7 @@ function startTaskExecutionForAgent(
   const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[execAgent.role] || execAgent.role;
   const deptConstraint = deptId ? getDeptRoleConstraint(deptId, deptName) : "";
   const conversationCtx = getRecentConversationContext(execAgent.id);
-  const spawnPrompt = [
+  const spawnPrompt = buildTaskExecutionPrompt([
     `[Task] ${taskData.title}`,
     taskData.description ? `\n${taskData.description}` : "",
     conversationCtx,
@@ -4571,7 +5767,9 @@ function startTaskExecutionForAgent(
     execAgent.personality ? `Personality: ${execAgent.personality}` : "",
     deptConstraint,
     `Please complete the task above thoroughly. Use the conversation context above if relevant.`,
-  ].filter(Boolean).join("\n");
+  ], {
+    allowWarningFix: hasExplicitWarningFixRequest(taskData.title, taskData.description),
+  });
 
   appendTaskLog(taskId, "system", `RUN start (agent=${execAgent.name}, provider=${provider})`);
   if (provider === "copilot" || provider === "antigravity") {
@@ -4667,6 +5865,7 @@ function startPlannedApprovalMeeting(
 
       const pushTranscript = (leader: AgentRow, content: string) => {
         transcript.push({
+          speaker_agent_id: leader.id,
           speaker: getAgentDisplayName(leader, lang),
           department: getDeptName(leader.department_id ?? ""),
           role: getRoleLabel(leader.role, lang as Lang),
@@ -5430,7 +6629,7 @@ app.patch("/api/agents/:id", (req, res) => {
   }
 
   params.push(id);
-  db.prepare(`UPDATE agents SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+  db.prepare(`UPDATE agents SET ${updates.join(", ")} WHERE id = ?`).run(...(params as SQLInputValue[]));
 
   const updated = db.prepare("SELECT * FROM agents WHERE id = ?").get(id);
   broadcast("agent_status", updated);
@@ -5472,7 +6671,13 @@ app.post("/api/agents/:id/spawn", (req, res) => {
   const projectPath = task.project_path || process.cwd();
   const logPath = path.join(logsDir, `${taskId}.log`);
 
-  const prompt = `${task.title}\n\n${task.description || ""}`;
+  const prompt = buildTaskExecutionPrompt([
+    `[Task] ${task.title}`,
+    task.description ? `\n${task.description}` : "",
+    "Please complete the task above thoroughly.",
+  ], {
+    allowWarningFix: hasExplicitWarningFixRequest(task.title, task.description),
+  });
 
   appendTaskLog(taskId, "system", `RUN start (agent=${agent.name}, provider=${provider})`);
 
@@ -5583,7 +6788,7 @@ app.get("/api/tasks", (req, res) => {
     LEFT JOIN departments d ON t.department_id = d.id
     ${where}
     ORDER BY t.priority DESC, t.updated_at DESC
-  `).all(...params);
+  `).all(...(params as SQLInputValue[]));
 
   res.json({ tasks });
 });
@@ -5692,12 +6897,12 @@ app.get("/api/tasks/:id/meeting-minutes", (req, res) => {
 
   const meetings = db.prepare(
     `SELECT * FROM meeting_minutes WHERE task_id IN (${taskIds.map(() => '?').join(',')}) ORDER BY started_at DESC, round DESC`
-  ).all(...taskIds) as MeetingMinutesRow[];
+  ).all(...taskIds) as unknown as MeetingMinutesRow[];
 
   const data = meetings.map((meeting) => {
     const entries = db.prepare(
       "SELECT * FROM meeting_minute_entries WHERE meeting_id = ? ORDER BY seq ASC, id ASC"
-    ).all(meeting.id) as MeetingMinuteEntryRow[];
+    ).all(meeting.id) as unknown as MeetingMinuteEntryRow[];
     return { ...meeting, entries };
   });
 
@@ -5736,7 +6941,7 @@ app.patch("/api/tasks/:id", (req, res) => {
   }
 
   params.push(id);
-  db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+  db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...(params as SQLInputValue[]));
 
   const nextStatus = typeof body.status === "string" ? body.status : null;
   if (nextStatus && (nextStatus === "cancelled" || nextStatus === "pending" || nextStatus === "done" || nextStatus === "inbox")) {
@@ -5874,7 +7079,7 @@ app.patch("/api/subtasks/:id", (req, res) => {
   if (updates.length === 0) return res.status(400).json({ error: "no_fields" });
 
   params.push(id);
-  db.prepare(`UPDATE subtasks SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+  db.prepare(`UPDATE subtasks SET ${updates.join(", ")} WHERE id = ?`).run(...(params as SQLInputValue[]));
 
   const subtask = db.prepare("SELECT * FROM subtasks WHERE id = ?").get(id);
   broadcast("subtask_update", subtask);
@@ -6034,6 +7239,15 @@ app.post("/api/tasks/:id/run", (req, res) => {
     appendTaskLog(id, "system", `Git worktree created: ${worktreePath} (branch: climpire/${id.slice(0, 8)})`);
   }
 
+  // Generate project context (cached by git HEAD) and recent changes
+  const projectContext = generateProjectContext(projectPath);
+  const recentChanges = getRecentChanges(projectPath, id);
+
+  // For Claude provider: ensure CLAUDE.md exists in worktree
+  if (worktreePath && provider === "claude") {
+    ensureClaudeMd(projectPath, worktreePath);
+  }
+
   // Build rich prompt with agent context + conversation history + role constraint
   const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[agent.role] || agent.role;
   const deptConstraint = agent.department_id ? getDeptRoleConstraint(agent.department_id, agent.department_name || agent.department_id) : "";
@@ -6099,7 +7313,9 @@ Whenever you complete a subtask, report it in this format:
     ["请完整地完成上述任务。如有需要，请参考上方对话上下文。"],
   ), taskLang);
 
-  const prompt = [
+  const prompt = buildTaskExecutionPrompt([
+    projectContext ? `[Project Structure]\n${projectContext.length > 4000 ? projectContext.slice(0, 4000) + "\n... (truncated)" : projectContext}` : "",
+    recentChanges ? `[Recent Changes]\n${recentChanges}` : "",
     `[Task] ${task.title}`,
     task.description ? `\n${task.description}` : "",
     conversationCtx,
@@ -6112,7 +7328,10 @@ Whenever you complete a subtask, report it in this format:
     subModelHint,
     localeInstruction(taskLang),
     runInstruction,
-  ].filter(Boolean).join("\n");
+    "Project structure is already provided above. Do NOT spend time exploring it again unless new errors require it.",
+  ], {
+    allowWarningFix: hasExplicitWarningFixRequest(task.title, task.description),
+  });
 
   appendTaskLog(id, "system", `RUN start (agent=${agent.name}, provider=${provider})`);
 
@@ -6856,7 +8075,7 @@ function scheduleAnnouncementReplies(announcement: string): void {
   const lang = resolveLang(announcement);
   const teamLeaders = db.prepare(
     "SELECT * FROM agents WHERE role = 'team_leader' AND status != 'offline'"
-  ).all() as AgentRow[];
+  ).all() as unknown as AgentRow[];
 
   let delay = 1500; // First reply after 1.5s
   for (const leader of teamLeaders) {
@@ -7131,7 +8350,7 @@ function findBestSubordinate(deptId: string, excludeId: string): AgentRow | null
     `SELECT * FROM agents WHERE department_id = ? AND id != ? AND role != 'team_leader' ORDER BY
        CASE status WHEN 'idle' THEN 0 WHEN 'break' THEN 1 WHEN 'working' THEN 2 ELSE 3 END,
        CASE role WHEN 'senior' THEN 0 WHEN 'junior' THEN 1 WHEN 'intern' THEN 2 ELSE 3 END`
-  ).all(deptId, excludeId) as AgentRow[];
+  ).all(deptId, excludeId) as unknown as AgentRow[];
   return agents[0] ?? null;
 }
 
@@ -7242,7 +8461,7 @@ function buildSubtaskDelegationPrompt(
     ["先理解项目全局上下文，再只执行你负责的范围。"],
   ), lang);
 
-  return [
+  return buildTaskExecutionPrompt([
     header,
     ``,
     `${originalTaskLabel}: ${parentTask.title}`,
@@ -7262,7 +8481,14 @@ function buildSubtaskDelegationPrompt(
     deptConstraint,
     ``,
     finalInstruction,
-  ].filter(Boolean).join("\n");
+  ], {
+    allowWarningFix: hasExplicitWarningFixRequest(
+      parentTask.title,
+      parentTask.description,
+      subtask.title,
+      subtask.description,
+    ),
+  });
 }
 
 /**
@@ -7272,7 +8498,7 @@ function buildSubtaskDelegationPrompt(
 function processSubtaskDelegations(taskId: string): void {
   const foreignSubtasks = db.prepare(
     "SELECT * FROM subtasks WHERE task_id = ? AND target_department_id IS NOT NULL AND delegated_task_id IS NULL ORDER BY created_at"
-  ).all(taskId) as SubtaskRow[];
+  ).all(taskId) as unknown as SubtaskRow[];
 
   if (foreignSubtasks.length === 0) return;
 
@@ -7919,7 +9145,7 @@ function startCrossDeptCooperation(
         const roleLabel = { team_leader: "Team Leader", senior: "Senior", junior: "Junior", intern: "Intern" }[execAgent.role] || execAgent.role;
         const deptConstraint = getDeptRoleConstraint(crossDeptId, crossDeptName);
         const crossConversationCtx = getRecentConversationContext(execAgent.id);
-        const spawnPrompt = [
+        const spawnPrompt = buildTaskExecutionPrompt([
           `[Task] ${crossTaskData.title}`,
           crossTaskData.description ? `\n${crossTaskData.description}` : "",
           crossConversationCtx,
@@ -7928,7 +9154,9 @@ function startCrossDeptCooperation(
           execAgent.personality ? `Personality: ${execAgent.personality}` : "",
           deptConstraint,
           `Please complete the task above thoroughly. Use the conversation context above if relevant.`,
-        ].filter(Boolean).join("\n");
+        ], {
+          allowWarningFix: hasExplicitWarningFixRequest(crossTaskData.title, crossTaskData.description),
+        });
 
         appendTaskLog(crossTaskId, "system", `RUN start (agent=${execAgent.name}, provider=${execProvider})`);
         const crossModelConfig = getProviderModelConfig();
@@ -8115,7 +9343,7 @@ function pickPlanningReportAssignee(preferredAgentId: string | null): AgentRow |
   const planningAgents = db.prepare(`
     SELECT * FROM agents
     WHERE department_id = 'planning' AND status != 'offline'
-  `).all() as AgentRow[];
+  `).all() as unknown as AgentRow[];
   if (planningAgents.length === 0) return null;
   const claudeAgents = planningAgents.filter((a) => (a.cli_provider || "") === "claude");
   const candidatePool = claudeAgents.length > 0 ? claudeAgents : planningAgents;
@@ -8662,45 +9890,105 @@ app.get("/api/messages", (req, res) => {
     ${where}
     ORDER BY m.created_at DESC
     LIMIT ?
-  `).all(...params);
+  `).all(...(params as SQLInputValue[]));
 
   res.json({ messages: messages.reverse() }); // return in chronological order
 });
 
-app.post("/api/messages", (req, res) => {
-  const body = req.body ?? {};
-  const id = randomUUID();
-  const t = nowMs();
-
+app.post("/api/messages", async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const idempotencyKey = resolveMessageIdempotencyKey(req, body, "api.messages");
   const content = body.content;
   if (!content || typeof content !== "string") {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/messages",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "validation_error",
+      statusCode: 400,
+      detail: "content_required",
+    })) return;
     return res.status(400).json({ error: "content_required" });
   }
 
-  const senderType = body.sender_type || "ceo";
-  const senderId = body.sender_id ?? null;
-  const receiverType = body.receiver_type || "all";
-  const receiverId = body.receiver_id ?? null;
-  const messageType = body.message_type || "chat";
-  const taskId = body.task_id ?? null;
+  const senderType = typeof body.sender_type === "string" ? body.sender_type : "ceo";
+  const senderId = typeof body.sender_id === "string" ? body.sender_id : null;
+  const receiverType = typeof body.receiver_type === "string" ? body.receiver_type : "all";
+  const receiverId = typeof body.receiver_id === "string" ? body.receiver_id : null;
+  const messageType = typeof body.message_type === "string" ? body.message_type : "chat";
+  const taskId = typeof body.task_id === "string" ? body.task_id : null;
 
-  db.prepare(`
-    INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, task_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, senderType, senderId, receiverType, receiverId, content, messageType, taskId, t);
+  let storedMessage: StoredMessage;
+  let created: boolean;
+  try {
+    ({ message: storedMessage, created } = await insertMessageWithIdempotency({
+      senderType,
+      senderId,
+      receiverType,
+      receiverId,
+      content,
+      messageType,
+      taskId,
+      idempotencyKey,
+    }));
+  } catch (err) {
+    if (err instanceof IdempotencyConflictError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/messages",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "idempotency_conflict",
+        statusCode: 409,
+        detail: "payload_mismatch",
+      })) return;
+      return res.status(409).json({ error: "idempotency_conflict", idempotency_key: err.key });
+    }
+    if (err instanceof StorageBusyError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/messages",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "storage_busy",
+        statusCode: 503,
+        detail: `operation=${err.operation}, attempts=${err.attempts}`,
+      })) return;
+      return res.status(503).json({ error: "storage_busy", retryable: true, operation: err.operation });
+    }
+    throw err;
+  }
 
-  const msg = {
-    id,
-    sender_type: senderType,
-    sender_id: senderId,
-    receiver_type: receiverType,
-    receiver_id: receiverId,
-    content,
-    message_type: messageType,
-    task_id: taskId,
-    created_at: t,
-  };
+  const msg = { ...storedMessage };
 
+  if (!created) {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/messages",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "duplicate",
+      statusCode: 200,
+      messageId: msg.id,
+      detail: "idempotent_replay",
+    })) return;
+    return res.json({ ok: true, message: msg, duplicate: true });
+  }
+
+  if (!(await recordAcceptedIngressAuditOrRollback(
+    res,
+    {
+      endpoint: "/api/messages",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "accepted",
+      statusCode: 200,
+      detail: "created",
+    },
+    msg.id,
+  ))) return;
   broadcast("new_message", msg);
 
   // Schedule agent auto-reply when CEO messages an agent
@@ -8745,32 +10033,91 @@ app.post("/api/messages", (req, res) => {
   res.json({ ok: true, message: msg });
 });
 
-app.post("/api/announcements", (req, res) => {
-  const body = req.body ?? {};
+app.post("/api/announcements", async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const idempotencyKey = resolveMessageIdempotencyKey(req, body, "api.announcements");
   const content = body.content;
   if (!content || typeof content !== "string") {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/announcements",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "validation_error",
+      statusCode: 400,
+      detail: "content_required",
+    })) return;
     return res.status(400).json({ error: "content_required" });
   }
 
-  const id = randomUUID();
-  const t = nowMs();
+  let storedMessage: StoredMessage;
+  let created: boolean;
+  try {
+    ({ message: storedMessage, created } = await insertMessageWithIdempotency({
+      senderType: "ceo",
+      senderId: null,
+      receiverType: "all",
+      receiverId: null,
+      content,
+      messageType: "announcement",
+      idempotencyKey,
+    }));
+  } catch (err) {
+    if (err instanceof IdempotencyConflictError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/announcements",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "idempotency_conflict",
+        statusCode: 409,
+        detail: "payload_mismatch",
+      })) return;
+      return res.status(409).json({ error: "idempotency_conflict", idempotency_key: err.key });
+    }
+    if (err instanceof StorageBusyError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/announcements",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "storage_busy",
+        statusCode: 503,
+        detail: `operation=${err.operation}, attempts=${err.attempts}`,
+      })) return;
+      return res.status(503).json({ error: "storage_busy", retryable: true, operation: err.operation });
+    }
+    throw err;
+  }
+  const msg = { ...storedMessage };
 
-  db.prepare(`
-    INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, created_at)
-    VALUES (?, 'ceo', NULL, 'all', NULL, ?, 'announcement', ?)
-  `).run(id, content, t);
+  if (!created) {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/announcements",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "duplicate",
+      statusCode: 200,
+      messageId: msg.id,
+      detail: "idempotent_replay",
+    })) return;
+    return res.json({ ok: true, message: msg, duplicate: true });
+  }
 
-  const msg = {
-    id,
-    sender_type: "ceo",
-    sender_id: null,
-    receiver_type: "all",
-    receiver_id: null,
-    content,
-    message_type: "announcement",
-    created_at: t,
-  };
-
+  if (!(await recordAcceptedIngressAuditOrRollback(
+    res,
+    {
+      endpoint: "/api/announcements",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "accepted",
+      statusCode: 200,
+      detail: "created",
+    },
+    msg.id,
+  ))) return;
   broadcast("announcement", msg);
 
   // Team leaders respond to announcements with staggered delays
@@ -8809,33 +10156,91 @@ app.post("/api/announcements", (req, res) => {
 });
 
 // ── Directives (CEO ! command) ──────────────────────────────────────────────
-app.post("/api/directives", (req, res) => {
-  const body = req.body ?? {};
+app.post("/api/directives", async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const idempotencyKey = resolveMessageIdempotencyKey(req, body, "api.directives");
   const content = body.content;
   if (!content || typeof content !== "string") {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/directives",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "validation_error",
+      statusCode: 400,
+      detail: "content_required",
+    })) return;
     return res.status(400).json({ error: "content_required" });
   }
 
-  const id = randomUUID();
-  const t = nowMs();
+  let storedMessage: StoredMessage;
+  let created: boolean;
+  try {
+    ({ message: storedMessage, created } = await insertMessageWithIdempotency({
+      senderType: "ceo",
+      senderId: null,
+      receiverType: "all",
+      receiverId: null,
+      content,
+      messageType: "directive",
+      idempotencyKey,
+    }));
+  } catch (err) {
+    if (err instanceof IdempotencyConflictError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/directives",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "idempotency_conflict",
+        statusCode: 409,
+        detail: "payload_mismatch",
+      })) return;
+      return res.status(409).json({ error: "idempotency_conflict", idempotency_key: err.key });
+    }
+    if (err instanceof StorageBusyError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/directives",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "storage_busy",
+        statusCode: 503,
+        detail: `operation=${err.operation}, attempts=${err.attempts}`,
+      })) return;
+      return res.status(503).json({ error: "storage_busy", retryable: true, operation: err.operation });
+    }
+    throw err;
+  }
+  const msg = { ...storedMessage };
 
-  // 1. Store directive message
-  db.prepare(`
-    INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, created_at)
-    VALUES (?, 'ceo', NULL, 'all', NULL, ?, 'directive', ?)
-  `).run(id, content, t);
+  if (!created) {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/directives",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "duplicate",
+      statusCode: 200,
+      messageId: msg.id,
+      detail: "idempotent_replay",
+    })) return;
+    return res.json({ ok: true, message: msg, duplicate: true });
+  }
 
-  const msg = {
-    id,
-    sender_type: "ceo",
-    sender_id: null,
-    receiver_type: "all",
-    receiver_id: null,
-    content,
-    message_type: "directive",
-    created_at: t,
-  };
-
+  if (!(await recordAcceptedIngressAuditOrRollback(
+    res,
+    {
+      endpoint: "/api/directives",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "accepted",
+      statusCode: 200,
+      detail: "created",
+    },
+    msg.id,
+  ))) return;
   // 2. Broadcast to all
   broadcast("announcement", msg);
 
@@ -8897,10 +10302,20 @@ app.post("/api/directives", (req, res) => {
 });
 
 // ── Inbound webhook (Telegram / external) ───────────────────────────────────
-app.post("/api/inbox", (req, res) => {
-  const body = req.body ?? {};
+app.post("/api/inbox", async (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const idempotencyKey = resolveMessageIdempotencyKey(req, body, "api.inbox");
   const text = body.text;
   if (!text || typeof text !== "string" || !text.trim()) {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/inbox",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "validation_error",
+      statusCode: 400,
+      detail: "text_required",
+    })) return;
     return res.status(400).json({ error: "text_required" });
   }
 
@@ -8908,30 +10323,87 @@ app.post("/api/inbox", (req, res) => {
   const isDirective = raw.startsWith("$");
   const content = isDirective ? raw.slice(1).trimStart() : raw;
   if (!content) {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/inbox",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "validation_error",
+      statusCode: 400,
+      detail: "empty_content",
+    })) return;
     return res.status(400).json({ error: "empty_content" });
   }
 
-  const id = randomUUID();
-  const t = nowMs();
   const messageType = isDirective ? "directive" : "announcement";
+  let storedMessage: StoredMessage;
+  let created: boolean;
+  try {
+    ({ message: storedMessage, created } = await insertMessageWithIdempotency({
+      senderType: "ceo",
+      senderId: null,
+      receiverType: "all",
+      receiverId: null,
+      content,
+      messageType,
+      idempotencyKey,
+    }));
+  } catch (err) {
+    if (err instanceof IdempotencyConflictError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/inbox",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "idempotency_conflict",
+        statusCode: 409,
+        detail: "payload_mismatch",
+      })) return;
+      return res.status(409).json({ error: "idempotency_conflict", idempotency_key: err.key });
+    }
+    if (err instanceof StorageBusyError) {
+      if (!recordMessageIngressAuditOr503(res, {
+        endpoint: "/api/inbox",
+        req,
+        body,
+        idempotencyKey,
+        outcome: "storage_busy",
+        statusCode: 503,
+        detail: `operation=${err.operation}, attempts=${err.attempts}`,
+      })) return;
+      return res.status(503).json({ error: "storage_busy", retryable: true, operation: err.operation });
+    }
+    throw err;
+  }
+  const msg = { ...storedMessage };
 
-  // Store message
-  db.prepare(`
-    INSERT INTO messages (id, sender_type, sender_id, receiver_type, receiver_id, content, message_type, created_at)
-    VALUES (?, 'ceo', NULL, 'all', NULL, ?, ?, ?)
-  `).run(id, content, messageType, t);
+  if (!created) {
+    if (!recordMessageIngressAuditOr503(res, {
+      endpoint: "/api/inbox",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "duplicate",
+      statusCode: 200,
+      messageId: msg.id,
+      detail: "idempotent_replay",
+    })) return;
+    return res.json({ ok: true, id: msg.id, directive: isDirective, duplicate: true });
+  }
 
-  const msg = {
-    id,
-    sender_type: "ceo",
-    sender_id: null,
-    receiver_type: "all",
-    receiver_id: null,
-    content,
-    message_type: messageType,
-    created_at: t,
-  };
-
+  if (!(await recordAcceptedIngressAuditOrRollback(
+    res,
+    {
+      endpoint: "/api/inbox",
+      req,
+      body,
+      idempotencyKey,
+      outcome: "accepted",
+      statusCode: 200,
+      detail: isDirective ? "created:directive" : "created:announcement",
+    },
+    msg.id,
+  ))) return;
   // Broadcast
   broadcast("announcement", msg);
 
@@ -9002,7 +10474,7 @@ app.post("/api/inbox", (req, res) => {
     }, mentionDelay);
   }
 
-  res.json({ ok: true, id, directive: isDirective });
+  res.json({ ok: true, id: msg.id, directive: isDirective });
 });
 
 // Delete conversation messages
@@ -10153,7 +11625,7 @@ app.put("/api/oauth/accounts/:id", (req, res) => {
   }
 
   params.push(id);
-  db.prepare(`UPDATE oauth_accounts SET ${updates.join(", ")} WHERE id = ?`).run(...params);
+  db.prepare(`UPDATE oauth_accounts SET ${updates.join(", ")} WHERE id = ?`).run(...(params as SQLInputValue[]));
   const providerRow = db.prepare("SELECT provider FROM oauth_accounts WHERE id = ?").get(id) as { provider: string };
   ensureOAuthActiveAccount(providerRow.provider);
   res.json({ ok: true });
@@ -10702,13 +12174,12 @@ function pruneDuplicateReviewMeetings(): void {
 
   const delEntries = db.prepare("DELETE FROM meeting_minute_entries WHERE meeting_id = ?");
   const delMeetings = db.prepare("DELETE FROM meeting_minutes WHERE id = ?");
-  const tx = db.transaction((ids: string[]) => {
-    for (const id of ids) {
+  runInTransaction(() => {
+    for (const id of rows.map((r) => r.id)) {
       delEntries.run(id);
       delMeetings.run(id);
     }
   });
-  tx(rows.map((r) => r.id));
 }
 
 function recoverInterruptedWorkflowOnStartup(): void {

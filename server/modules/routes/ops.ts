@@ -1311,7 +1311,7 @@ app.put("/api/oauth/accounts/:id", (req, res) => {
 // OAuth Provider Model Listing
 // ---------------------------------------------------------------------------
 async function fetchOpenCodeModels(): Promise<Record<string, string[]>> {
-  const grouped: Record<string, string[]> = {};
+  const grouped: Record<string, string[]> = { opencode: [] };
   try {
     const output = await execWithTimeout("opencode", ["models"], 10_000);
     for (const line of output.split(/\r?\n/)) {
@@ -1322,10 +1322,11 @@ async function fetchOpenCodeModels(): Promise<Record<string, string[]>> {
       if (provider === "github-copilot") {
         if (!grouped.copilot) grouped.copilot = [];
         grouped.copilot.push(trimmed);
-      }
-      if (provider === "google" && trimmed.includes("antigravity")) {
+      } else if (provider === "google" && trimmed.includes("antigravity")) {
         if (!grouped.antigravity) grouped.antigravity = [];
         grouped.antigravity.push(trimmed);
+      } else {
+        grouped.opencode.push(trimmed);
       }
     }
   } catch {

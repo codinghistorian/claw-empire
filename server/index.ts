@@ -418,7 +418,14 @@ function queueWake(params: { key: string; text: string; debounceMs?: number }) {
 function notifyTaskStatus(taskId: string, title: string, status: string): void {
   if (!OPENCLAW_CONFIG_PATH) return;
   const emoji = status === "in_progress" ? "\u{1F680}" : status === "review" ? "\u{1F50D}" : status === "done" ? "\u2705" : "\u{1F4CB}";
-  const label = status === "in_progress" ? "진행 시작" : status === "review" ? "검토 중" : status === "done" ? "완료" : status;
+  const lang = resolveLang(title);
+  const label = status === "in_progress"
+    ? pickL(l(["진행 시작"], ["Started"], ["開始"], ["开始"]), lang)
+    : status === "review"
+      ? pickL(l(["검토 중"], ["In Review"], ["レビュー中"], ["审核中"]), lang)
+      : status === "done"
+        ? pickL(l(["완료"], ["Completed"], ["完了"], ["完成"]), lang)
+        : status;
   queueWake({
     key: `task:${taskId}:${status}`,
     text: `${emoji} [${label}] ${title}`,
@@ -1848,9 +1855,17 @@ function createWorktree(projectPath: string, taskId: string, agentName: string):
   }
 }
 
+const DIFF_SUMMARY_NONE = "__DIFF_NONE__";
+const DIFF_SUMMARY_ERROR = "__DIFF_ERROR__";
+
+function hasVisibleDiffSummary(summary: string): boolean {
+  return Boolean(summary && summary !== DIFF_SUMMARY_NONE && summary !== DIFF_SUMMARY_ERROR);
+}
+
 function mergeWorktree(projectPath: string, taskId: string): { success: boolean; message: string; conflicts?: string[] } {
   const info = taskWorktrees.get(taskId);
   if (!info) return { success: false, message: "No worktree found for this task" };
+  const lang = resolveLang();
 
   try {
     // Get current branch name in the original repo
@@ -1864,7 +1879,15 @@ function mergeWorktree(projectPath: string, taskId: string): { success: boolean;
         cwd: projectPath, stdio: "pipe", timeout: 10000,
       }).toString().trim();
       if (!diffCheck) {
-        return { success: true, message: "변경사항 없음 — 병합 불필요" };
+        return {
+          success: true,
+          message: pickL(l(
+            ["변경사항이 없어 병합이 필요하지 않습니다."],
+            ["No changes to merge."],
+            ["マージする変更がありません。"],
+            ["没有可合并的更改。"],
+          ), lang),
+        };
       }
     } catch { /* proceed with merge attempt anyway */ }
 
@@ -1874,7 +1897,15 @@ function mergeWorktree(projectPath: string, taskId: string): { success: boolean;
       cwd: projectPath, stdio: "pipe", timeout: 30000,
     });
 
-    return { success: true, message: `병합 완료: ${info.branchName} → ${currentBranch}` };
+    return {
+      success: true,
+      message: pickL(l(
+        [`병합 완료: ${info.branchName} → ${currentBranch}`],
+        [`Merge completed: ${info.branchName} -> ${currentBranch}`],
+        [`マージ完了: ${info.branchName} -> ${currentBranch}`],
+        [`合并完成: ${info.branchName} -> ${currentBranch}`],
+      ), lang),
+    };
   } catch (err: unknown) {
     // Detect conflicts by checking git status instead of parsing error messages
     try {
@@ -1889,7 +1920,12 @@ function mergeWorktree(projectPath: string, taskId: string): { success: boolean;
 
         return {
           success: false,
-          message: `병합 충돌 발생: ${conflicts.length}개 파일에서 충돌이 있습니다. 수동 해결이 필요합니다.`,
+          message: pickL(l(
+            [`병합 충돌 발생: ${conflicts.length}개 파일에서 충돌이 있습니다. 수동 해결이 필요합니다.`],
+            [`Merge conflict: ${conflicts.length} file(s) have conflicts and need manual resolution.`],
+            [`マージ競合: ${conflicts.length}件のファイルで競合が発生し、手動解決が必要です。`],
+            [`合并冲突：${conflicts.length} 个文件存在冲突，需要手动解决。`],
+          ), lang),
           conflicts,
         };
       }
@@ -1899,7 +1935,15 @@ function mergeWorktree(projectPath: string, taskId: string): { success: boolean;
     try { execFileSync("git", ["merge", "--abort"], { cwd: projectPath, stdio: "pipe", timeout: 5000 }); } catch { /* ignore */ }
 
     const msg = err instanceof Error ? err.message : String(err);
-    return { success: false, message: `병합 실패: ${msg}` };
+    return {
+      success: false,
+      message: pickL(l(
+        [`병합 실패: ${msg}`],
+        [`Merge failed: ${msg}`],
+        [`マージ失敗: ${msg}`],
+        [`合并失败: ${msg}`],
+      ), lang),
+    };
   }
 }
 
@@ -1943,7 +1987,7 @@ function rollbackTaskWorktree(taskId: string, reason: string): boolean {
   if (!info) return false;
 
   const diffSummary = getWorktreeDiffSummary(info.projectPath, taskId);
-  if (diffSummary && diffSummary !== "변경사항 없음" && diffSummary !== "diff 조회 실패") {
+  if (hasVisibleDiffSummary(diffSummary)) {
     appendTaskLog(taskId, "system", `Rollback(${reason}) diff summary:\n${diffSummary}`);
   }
 
@@ -1966,9 +2010,9 @@ function getWorktreeDiffSummary(projectPath: string, taskId: string): string {
       cwd: projectPath, stdio: "pipe", timeout: 10000,
     }).toString().trim();
 
-    return stat || "변경사항 없음";
+    return stat || DIFF_SUMMARY_NONE;
   } catch {
-    return "diff 조회 실패";
+    return DIFF_SUMMARY_ERROR;
   }
 }
 
@@ -4774,9 +4818,15 @@ function startProgressTimer(taskId: string, taskTitle: string, departmentId: str
     }
     const leader = findTeamLeader(departmentId);
     if (leader) {
+      const lang = resolveLang(taskTitle);
       sendAgentMessage(
         leader,
-        `대표님, '${taskTitle}' 작업 진행 중입니다. 현재 순조롭게 진행되고 있어요.`,
+        pickL(l(
+          [`대표님, '${taskTitle}' 작업 진행 중입니다. 현재 순조롭게 진행되고 있어요.`],
+          [`CEO, '${taskTitle}' is in progress and currently going smoothly.`],
+          [`CEO、'${taskTitle}' は進行中で、現在は順調です。`],
+          [`CEO，'${taskTitle}' 正在进行中，目前进展顺利。`],
+        ), lang),
         "report",
         "all",
         null,
@@ -6116,21 +6166,37 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
 
       // If worktree exists, include diff summary in the report
       const wtInfo = taskWorktrees.get(taskId);
+      const lang = resolveLang(task.description ?? task.title);
       let diffSummary = "";
       if (wtInfo) {
         diffSummary = getWorktreeDiffSummary(wtInfo.projectPath, taskId);
-        if (diffSummary && diffSummary !== "변경사항 없음") {
+        if (hasVisibleDiffSummary(diffSummary)) {
           appendTaskLog(taskId, "system", `Worktree diff summary:\n${diffSummary}`);
         }
       }
 
       // Team leader sends completion report with actual result content + diff
       let reportContent = reportBody
-        ? `대표님, '${task.title}' 업무 완료 보고드립니다.\n\n📋 결과:\n${reportBody}`
-        : `대표님, '${task.title}' 업무 완료 보고드립니다. 작업이 성공적으로 마무리되었습니다.`;
+        ? pickL(l(
+          [`대표님, '${task.title}' 업무 완료 보고드립니다.\n\n📋 결과:\n${reportBody}`],
+          [`CEO, reporting completion for '${task.title}'.\n\n📋 Result:\n${reportBody}`],
+          [`CEO、'${task.title}' の完了をご報告します。\n\n📋 結果:\n${reportBody}`],
+          [`CEO，汇报 '${task.title}' 已完成。\n\n📋 结果:\n${reportBody}`],
+        ), lang)
+        : pickL(l(
+          [`대표님, '${task.title}' 업무 완료 보고드립니다. 작업이 성공적으로 마무리되었습니다.`],
+          [`CEO, reporting completion for '${task.title}'. The work has been finished successfully.`],
+          [`CEO、'${task.title}' の完了をご報告します。作業は正常に完了しました。`],
+          [`CEO，汇报 '${task.title}' 已完成。任务已成功结束。`],
+        ), lang);
 
-      if (diffSummary && diffSummary !== "변경사항 없음" && diffSummary !== "diff 조회 실패") {
-        reportContent += `\n\n📝 변경사항 (branch: ${wtInfo?.branchName}):\n${diffSummary}`;
+      if (hasVisibleDiffSummary(diffSummary)) {
+        reportContent += pickL(l(
+          [`\n\n📝 변경사항 (branch: ${wtInfo?.branchName}):\n${diffSummary}`],
+          [`\n\n📝 Changes (branch: ${wtInfo?.branchName}):\n${diffSummary}`],
+          [`\n\n📝 変更点 (branch: ${wtInfo?.branchName}):\n${diffSummary}`],
+          [`\n\n📝 变更内容 (branch: ${wtInfo?.branchName}):\n${diffSummary}`],
+        ), lang);
       }
 
       sendAgentMessage(
@@ -6179,9 +6245,20 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
             }
           } catch { /* ignore */ }
 
+          const lang = resolveLang(task.description ?? task.title);
           const failContent = errorBody
-            ? `대표님, '${task.title}' 작업에 문제가 발생했습니다 (종료코드: ${exitCode}).\n\n❌ 오류 내용:\n${errorBody}\n\n재배정하거나 업무 내용을 수정한 후 다시 시도해주세요.`
-            : `대표님, '${task.title}' 작업에 문제가 발생했습니다 (종료코드: ${exitCode}). 에이전트를 재배정하거나 업무 내용을 수정한 후 다시 시도해주세요.`;
+            ? pickL(l(
+              [`대표님, '${task.title}' 작업에 문제가 발생했습니다 (종료코드: ${exitCode}).\n\n❌ 오류 내용:\n${errorBody}\n\n재배정하거나 업무 내용을 수정한 후 다시 시도해주세요.`],
+              [`CEO, '${task.title}' failed with an issue (exit code: ${exitCode}).\n\n❌ Error:\n${errorBody}\n\nPlease reassign the agent or revise the task, then try again.`],
+              [`CEO、'${task.title}' の処理中に問題が発生しました (終了コード: ${exitCode})。\n\n❌ エラー内容:\n${errorBody}\n\n担当再割り当てまたはタスク内容を修正して再試行してください。`],
+              [`CEO，'${task.title}' 执行时发生问题（退出码：${exitCode}）。\n\n❌ 错误内容:\n${errorBody}\n\n请重新分配代理或修改任务后重试。`],
+            ), lang)
+            : pickL(l(
+              [`대표님, '${task.title}' 작업에 문제가 발생했습니다 (종료코드: ${exitCode}). 에이전트를 재배정하거나 업무 내용을 수정한 후 다시 시도해주세요.`],
+              [`CEO, '${task.title}' failed with an issue (exit code: ${exitCode}). Please reassign the agent or revise the task, then try again.`],
+              [`CEO、'${task.title}' の処理中に問題が発生しました (終了コード: ${exitCode})。担当再割り当てまたはタスク内容を修正して再試行してください。`],
+              [`CEO，'${task.title}' 执行时发生问题（退出码：${exitCode}）。请重新分配代理或修改任务后重试。`],
+            ), lang);
 
           sendAgentMessage(
             leader,
@@ -6193,7 +6270,13 @@ function handleTaskRunComplete(taskId: string, exitCode: number): void {
           );
         }, 1500);
       }
-      notifyCeo(`'${task.title}' 작업 실패 (exit code: ${exitCode}).`, taskId);
+      const lang = resolveLang(task.description ?? task.title);
+      notifyCeo(pickL(l(
+        [`'${task.title}' 작업 실패 (exit code: ${exitCode}).`],
+        [`Task '${task.title}' failed (exit code: ${exitCode}).`],
+        [`'${task.title}' のタスクが失敗しました (exit code: ${exitCode})。`],
+        [`任务 '${task.title}' 失败（exit code: ${exitCode}）。`],
+      ), lang), taskId);
     }
 
     // Even on failure, trigger next cross-dept cooperation so the queue doesn't stall
@@ -6244,25 +6327,46 @@ function finishReview(taskId: string, taskTitle: string): void {
       const mergeResult = mergeWorktree(wtInfo.projectPath, taskId);
 
       if (mergeResult.success) {
-        appendTaskLog(taskId, "system", `Git merge 완료: ${mergeResult.message}`);
+        appendTaskLog(taskId, "system", `Git merge completed: ${mergeResult.message}`);
         cleanupWorktree(wtInfo.projectPath, taskId);
         appendTaskLog(taskId, "system", "Worktree cleaned up after successful merge");
-        mergeNote = " (병합 완료)";
+        mergeNote = pickL(l(
+          [" (병합 완료)"],
+          [" (merged)"],
+          [" (マージ完了)"],
+          ["（已合并）"],
+        ), lang);
       } else {
-        appendTaskLog(taskId, "system", `Git merge 실패: ${mergeResult.message}`);
+        appendTaskLog(taskId, "system", `Git merge failed: ${mergeResult.message}`);
 
         const conflictLeader = findTeamLeader(latestTask.department_id);
-        const conflictLeaderName = conflictLeader?.name_ko || conflictLeader?.name || "팀장";
+        const conflictLeaderName = conflictLeader
+          ? getAgentDisplayName(conflictLeader, lang)
+          : pickL(l(["팀장"], ["Team Lead"], ["チームリーダー"], ["组长"]), lang);
         const conflictFiles = mergeResult.conflicts?.length
-          ? `\n충돌 파일: ${mergeResult.conflicts.join(", ")}`
+          ? pickL(l(
+            [`\n충돌 파일: ${mergeResult.conflicts.join(", ")}`],
+            [`\nConflicting files: ${mergeResult.conflicts.join(", ")}`],
+            [`\n競合ファイル: ${mergeResult.conflicts.join(", ")}`],
+            [`\n冲突文件: ${mergeResult.conflicts.join(", ")}`],
+          ), lang)
           : "";
         notifyCeo(
-          `${conflictLeaderName}: '${taskTitle}' 병합 중 충돌이 발생했습니다. 수동 해결이 필요합니다.${conflictFiles}\n` +
-          `브랜치: ${wtInfo.branchName}`,
+          pickL(l(
+            [`${conflictLeaderName}: '${taskTitle}' 병합 중 충돌이 발생했습니다. 수동 해결이 필요합니다.${conflictFiles}\n브랜치: ${wtInfo.branchName}`],
+            [`${conflictLeaderName}: Merge conflict while merging '${taskTitle}'. Manual resolution is required.${conflictFiles}\nBranch: ${wtInfo.branchName}`],
+            [`${conflictLeaderName}: '${taskTitle}' のマージ中に競合が発生しました。手動解決が必要です。${conflictFiles}\nブランチ: ${wtInfo.branchName}`],
+            [`${conflictLeaderName}：合并 '${taskTitle}' 时发生冲突，需要手动解决。${conflictFiles}\n分支: ${wtInfo.branchName}`],
+          ), lang),
           taskId,
         );
 
-        mergeNote = " (병합 충돌 - 수동 해결 필요)";
+        mergeNote = pickL(l(
+          [" (병합 충돌 - 수동 해결 필요)"],
+          [" (merge conflict - manual resolution required)"],
+          [" (マージ競合 - 手動解決が必要)"],
+          ["（合并冲突 - 需要手动解决）"],
+        ), lang);
       }
     }
 
@@ -7049,11 +7153,18 @@ app.post("/api/tasks/:id/assign", (req, res) => {
   // B4: Notify CEO about assignment via team leader
   const leader = findTeamLeader(agent.department_id);
   if (leader) {
+    const lang = resolveLang(task.title);
     const agentRow = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
-    const agentName = agentRow?.name_ko || agent.name;
+    const agentName = agentRow ? getAgentDisplayName(agentRow, lang) : agent.name;
+    const leaderName = getAgentDisplayName(leader, lang);
     sendAgentMessage(
       leader,
-      `${leader.name_ko || leader.name}이(가) ${agentName}에게 '${task.title}' 업무를 할당했습니다.`,
+      pickL(l(
+        [`${leaderName}이(가) ${agentName}에게 '${task.title}' 업무를 할당했습니다.`],
+        [`${leaderName} assigned '${task.title}' to ${agentName}.`],
+        [`${leaderName}が '${task.title}' を${agentName}に割り当てました。`],
+        [`${leaderName} 已将 '${task.title}' 分配给 ${agentName}。`],
+      ), lang),
       "status_update",
       "all",
       null,
@@ -7075,6 +7186,7 @@ app.post("/api/tasks/:id/run", (req, res) => {
     status: string;
   } | undefined;
   if (!task) return res.status(404).json({ error: "not_found" });
+  const taskLang = resolveLang(task.description ?? task.title);
 
   if (task.status === "in_progress" || task.status === "collaborating") {
     return res.status(400).json({ error: "already_running" });
@@ -7143,9 +7255,9 @@ app.post("/api/tasks/:id/run", (req, res) => {
   const conversationCtx = getRecentConversationContext(agentId);
   // Non-CLI or non-multi-agent providers: instruct agent to output subtask plan as JSON
   const needsPlanInstruction = provider === "gemini" || provider === "copilot" || provider === "antigravity";
-  const subtaskInstruction = needsPlanInstruction ? `
-
-[작업 계획 출력 규칙]
+  const subtaskInstruction = needsPlanInstruction
+    ? `\n\n${pickL(l(
+      [`[작업 계획 출력 규칙]
 작업을 시작하기 전에 아래 JSON 형식으로 계획을 출력하세요:
 \`\`\`json
 {"subtasks": [{"title": "서브태스크 제목1"}, {"title": "서브태스크 제목2"}]}
@@ -7153,8 +7265,36 @@ app.post("/api/tasks/:id/run", (req, res) => {
 각 서브태스크를 완료할 때마다 아래 형식으로 보고하세요:
 \`\`\`json
 {"subtask_done": "완료된 서브태스크 제목"}
+\`\`\``],
+      [`[Task Plan Output Rules]
+Before starting work, print a plan in the JSON format below:
+\`\`\`json
+{"subtasks": [{"title": "Subtask title 1"}, {"title": "Subtask title 2"}]}
 \`\`\`
-` : "";
+Whenever you complete a subtask, report it in this format:
+\`\`\`json
+{"subtask_done": "Completed subtask title"}
+\`\`\``],
+      [`[作業計画の出力ルール]
+作業開始前に、次の JSON 形式で計画を出力してください:
+\`\`\`json
+{"subtasks": [{"title": "サブタスク1"}, {"title": "サブタスク2"}]}
+\`\`\`
+各サブタスクを完了するたびに、次の形式で報告してください:
+\`\`\`json
+{"subtask_done": "完了したサブタスク"}
+\`\`\``],
+      [`[任务计划输出规则]
+开始工作前，请按下述 JSON 格式输出计划:
+\`\`\`json
+{"subtasks": [{"title": "子任务1"}, {"title": "子任务2"}]}
+\`\`\`
+每完成一个子任务，请按下述格式汇报:
+\`\`\`json
+{"subtask_done": "已完成的子任务"}
+\`\`\``],
+    ), taskLang)}\n`
+    : "";
 
   // Resolve model config for this provider
   const modelConfig = getProviderModelConfig();
@@ -7212,8 +7352,21 @@ app.post("/api/tasks/:id/run", (req, res) => {
     broadcast("agent_status", updatedAgent);
     notifyTaskStatus(id, task.title, "in_progress");
 
-    const worktreeNote = worktreePath ? ` (격리 브랜치: climpire/${id.slice(0, 8)})` : "";
-    notifyCeo(`${agent.name_ko || agent.name}가 '${task.title}' 작업을 시작했습니다.${worktreeNote}`, id);
+    const assigneeName = taskLang === "ko" ? (agent.name_ko || agent.name) : agent.name;
+    const worktreeNote = worktreePath
+      ? pickL(l(
+        [` (격리 브랜치: climpire/${id.slice(0, 8)})`],
+        [` (isolated branch: climpire/${id.slice(0, 8)})`],
+        [` (分離ブランチ: climpire/${id.slice(0, 8)})`],
+        [`（隔离分支: climpire/${id.slice(0, 8)}）`],
+      ), taskLang)
+      : "";
+    notifyCeo(pickL(l(
+      [`${assigneeName}가 '${task.title}' 작업을 시작했습니다.${worktreeNote}`],
+      [`${assigneeName} started work on '${task.title}'.${worktreeNote}`],
+      [`${assigneeName}が '${task.title}' の作業を開始しました。${worktreeNote}`],
+      [`${assigneeName} 已开始处理 '${task.title}'。${worktreeNote}`],
+    ), taskLang), id);
 
     const taskRow = db.prepare("SELECT department_id FROM tasks WHERE id = ?").get(id) as { department_id: string | null } | undefined;
     startProgressTimer(id, task.title, taskRow?.department_id ?? null);
@@ -7245,8 +7398,21 @@ app.post("/api/tasks/:id/run", (req, res) => {
   notifyTaskStatus(id, task.title, "in_progress");
 
   // B4: Notify CEO that task started
-  const worktreeNote = worktreePath ? ` (격리 브랜치: climpire/${id.slice(0, 8)})` : "";
-  notifyCeo(`${agent.name_ko || agent.name}가 '${task.title}' 작업을 시작했습니다.${worktreeNote}`, id);
+  const assigneeName = taskLang === "ko" ? (agent.name_ko || agent.name) : agent.name;
+  const worktreeNote = worktreePath
+    ? pickL(l(
+      [` (격리 브랜치: climpire/${id.slice(0, 8)})`],
+      [` (isolated branch: climpire/${id.slice(0, 8)})`],
+      [` (分離ブランチ: climpire/${id.slice(0, 8)})`],
+      [`（隔离分支: climpire/${id.slice(0, 8)}）`],
+    ), taskLang)
+    : "";
+  notifyCeo(pickL(l(
+    [`${assigneeName}가 '${task.title}' 작업을 시작했습니다.${worktreeNote}`],
+    [`${assigneeName} started work on '${task.title}'.${worktreeNote}`],
+    [`${assigneeName}が '${task.title}' の作業を開始しました。${worktreeNote}`],
+    [`${assigneeName} 已开始处理 '${task.title}'。${worktreeNote}`],
+  ), taskLang), id);
 
   // B2: Start progress report timer for long-running tasks
   const taskRow = db.prepare("SELECT department_id FROM tasks WHERE id = ?").get(id) as { department_id: string | null } | undefined;
@@ -7268,6 +7434,7 @@ app.post("/api/tasks/:id/stop", (req, res) => {
     department_id: string | null;
   } | undefined;
   if (!task) return res.status(404).json({ error: "not_found" });
+  const lang = resolveLang(task.title);
 
   stopProgressTimer(id);
 
@@ -7285,9 +7452,19 @@ app.post("/api/tasks/:id/stop", (req, res) => {
     const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
     broadcast("task_update", updatedTask);
     if (targetStatus === "pending") {
-      notifyCeo(`'${task.title}' 작업이 보류 상태로 전환되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`, id);
+      notifyCeo(pickL(l(
+        [`'${task.title}' 작업이 보류 상태로 전환되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`],
+        [`'${task.title}' was moved to pending.${rolledBack ? " Code changes were rolled back via git." : ""}`],
+        [`'${task.title}' は保留状態に変更されました。${rolledBack ? " コード変更は git でロールバックされました。" : ""}`],
+        [`'${task.title}' 已转为待处理状态。${rolledBack ? " 代码变更已通过 git 回滚。" : ""}`],
+      ), lang), id);
     } else {
-      notifyCeo(`'${task.title}' 작업이 취소되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`, id);
+      notifyCeo(pickL(l(
+        [`'${task.title}' 작업이 취소되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`],
+        [`'${task.title}' was cancelled.${rolledBack ? " Code changes were rolled back via git." : ""}`],
+        [`'${task.title}' はキャンセルされました。${rolledBack ? " コード変更は git でロールバックされました。" : ""}`],
+        [`'${task.title}' 已取消。${rolledBack ? " 代码变更已通过 git 回滚。" : ""}`],
+      ), lang), id);
     }
     return res.json({
       ok: true,
@@ -7331,9 +7508,19 @@ app.post("/api/tasks/:id/stop", (req, res) => {
 
   // CEO notification
   if (targetStatus === "pending") {
-    notifyCeo(`'${task.title}' 작업이 보류 상태로 전환되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`, id);
+    notifyCeo(pickL(l(
+      [`'${task.title}' 작업이 보류 상태로 전환되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`],
+      [`'${task.title}' was moved to pending.${rolledBack ? " Code changes were rolled back via git." : ""}`],
+      [`'${task.title}' は保留状態に変更されました。${rolledBack ? " コード変更は git でロールバックされました。" : ""}`],
+      [`'${task.title}' 已转为待处理状态。${rolledBack ? " 代码变更已通过 git 回滚。" : ""}`],
+    ), lang), id);
   } else {
-    notifyCeo(`'${task.title}' 작업이 취소되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`, id);
+    notifyCeo(pickL(l(
+      [`'${task.title}' 작업이 취소되었습니다.${rolledBack ? " 코드 변경분은 git rollback 처리되었습니다." : ""}`],
+      [`'${task.title}' was cancelled.${rolledBack ? " Code changes were rolled back via git." : ""}`],
+      [`'${task.title}' はキャンセルされました。${rolledBack ? " コード変更は git でロールバックされました。" : ""}`],
+      [`'${task.title}' 已取消。${rolledBack ? " 代码变更已通过 git 回滚。" : ""}`],
+    ), lang), id);
   }
 
   res.json({ ok: true, stopped: true, status: targetStatus, pid: activeChild.pid, rolled_back: rolledBack });
@@ -7349,6 +7536,7 @@ app.post("/api/tasks/:id/resume", (req, res) => {
     assigned_agent_id: string | null;
   } | undefined;
   if (!task) return res.status(404).json({ error: "not_found" });
+  const lang = resolveLang(task.title);
 
   if (task.status !== "pending" && task.status !== "cancelled") {
     return res.status(400).json({ error: "invalid_status", message: `Cannot resume from '${task.status}'` });
@@ -7363,7 +7551,12 @@ app.post("/api/tasks/:id/resume", (req, res) => {
   const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
   broadcast("task_update", updatedTask);
 
-  notifyCeo(`'${task.title}' 작업이 복구되었습니다. (${targetStatus})`, id);
+  notifyCeo(pickL(l(
+    [`'${task.title}' 작업이 복구되었습니다. (${targetStatus})`],
+    [`'${task.title}' was resumed. (${targetStatus})`],
+    [`'${task.title}' が復旧されました。(${targetStatus})`],
+    [`'${task.title}' 已恢复。(${targetStatus})`],
+  ), lang), id);
 
   res.json({ ok: true, status: targetStatus });
 });
@@ -8169,8 +8362,10 @@ function findTeamLeader(deptId: string | null): AgentRow | null {
 }
 
 function getDeptName(deptId: string): string {
-  const d = db.prepare("SELECT name_ko FROM departments WHERE id = ?").get(deptId) as { name_ko: string } | undefined;
-  return d?.name_ko ?? deptId;
+  const lang = getPreferredLanguage();
+  const d = db.prepare("SELECT name, name_ko FROM departments WHERE id = ?").get(deptId) as { name: string; name_ko: string } | undefined;
+  if (!d) return deptId;
+  return lang === "ko" ? (d.name_ko || d.name) : (d.name || d.name_ko || deptId);
 }
 
 // Role enforcement: restrict agents to their department's domain
@@ -11761,13 +11956,19 @@ app.post("/api/tasks/:id/merge", (req, res) => {
   }
 
   const result = mergeWorktree(wtInfo.projectPath, id);
+  const lang = resolveLang();
 
   if (result.success) {
     cleanupWorktree(wtInfo.projectPath, id);
-    appendTaskLog(id, "system", `Manual merge 완료: ${result.message}`);
-    notifyCeo(`수동 병합 완료: ${result.message}`, id);
+    appendTaskLog(id, "system", `Manual merge completed: ${result.message}`);
+    notifyCeo(pickL(l(
+      [`수동 병합 완료: ${result.message}`],
+      [`Manual merge completed: ${result.message}`],
+      [`手動マージ完了: ${result.message}`],
+      [`手动合并完成: ${result.message}`],
+    ), lang), id);
   } else {
-    appendTaskLog(id, "system", `Manual merge 실패: ${result.message}`);
+    appendTaskLog(id, "system", `Manual merge failed: ${result.message}`);
   }
 
   res.json({ ok: result.success, message: result.message, conflicts: result.conflicts });
@@ -11783,7 +11984,13 @@ app.post("/api/tasks/:id/discard", (req, res) => {
 
   cleanupWorktree(wtInfo.projectPath, id);
   appendTaskLog(id, "system", "Worktree discarded (changes abandoned)");
-  notifyCeo(`작업 브랜치가 폐기되었습니다: climpire/${id.slice(0, 8)}`, id);
+  const lang = resolveLang();
+  notifyCeo(pickL(l(
+    [`작업 브랜치가 폐기되었습니다: climpire/${id.slice(0, 8)}`],
+    [`Task branch discarded: climpire/${id.slice(0, 8)}`],
+    [`タスクブランチを破棄しました: climpire/${id.slice(0, 8)}`],
+    [`任务分支已丢弃: climpire/${id.slice(0, 8)}`],
+  ), lang), id);
 
   res.json({ ok: true, message: "Worktree discarded" });
 });

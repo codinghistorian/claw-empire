@@ -1069,6 +1069,9 @@ function normalizeConversationReply(
     .trim();
   if (!text) return "";
 
+  // Collapse outputs like "A B A B A B" (same sentence cycle repeated by model stream quirks).
+  text = collapseRepeatedSentenceCycles(text);
+
   const sentenceLimit = typeof opts.maxSentences === "number"
     ? Math.max(0, Math.floor(opts.maxSentences))
     : 2;
@@ -1089,6 +1092,35 @@ function normalizeConversationReply(
 
   if (text.length > maxChars) {
     return `${text.slice(0, maxChars - 1).trimEnd()}…`;
+  }
+  return text;
+}
+
+function collapseRepeatedSentenceCycles(text: string): string {
+  const sentences = text
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (sentences.length < 4) return text;
+
+  const total = sentences.length;
+  for (let cycleLen = 1; cycleLen <= Math.floor(total / 2); cycleLen += 1) {
+    if (total % cycleLen !== 0) continue;
+    const repeatCount = total / cycleLen;
+    if (repeatCount < 2) continue;
+
+    const pattern = sentences.slice(0, cycleLen);
+    let repeated = true;
+    for (let i = cycleLen; i < total; i += 1) {
+      if (sentences[i] !== pattern[i % cycleLen]) {
+        repeated = false;
+        break;
+      }
+    }
+    if (!repeated) continue;
+
+    const collapsed = pattern.join(" ").trim();
+    if (collapsed.length >= 24) return collapsed;
   }
   return text;
 }

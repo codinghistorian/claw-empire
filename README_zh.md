@@ -63,7 +63,7 @@ Claw-Empire 将您的 CLI AI 编程助手 —— **Claude Code**、**Codex CLI**
 - OpenClaw 配置文档明确建议 `.env` 使用绝对路径（推荐不加引号）
 - 现有克隆仓库在 `git pull v1.0.5` 后，首次执行 `pnpm dev*` / `pnpm start*` 时也会自动执行一次迁移修复
 - AGENTS 编排规则新增 `INBOX_SECRET_DISCOVERY_V2`，可从 shell 环境变量、`.env`、`.env.clone` 及常见项目根目录自动发现密钥
-- 修复代理一对一聊天中长回复被过早截断的问题
+- 修复代理一对一聊天中长回复被过早截断的问题，并抑制同一句式循环重复输出
 - 详细说明：[`docs/releases/v1.0.5.md`](docs/releases/v1.0.5.md)
 
 ---

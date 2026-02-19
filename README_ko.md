@@ -63,7 +63,7 @@ Claw-Empire는 CLI 기반 AI 코딩 어시스턴트 — **Claude Code**, **Codex
 - OpenClaw 설정 문서에 `.env` 절대경로(따옴표 없이 권장) 규칙을 명확히 반영
 - 기존 클론 사용자가 `v1.0.5`를 `git pull`만 한 경우에도 첫 `pnpm dev*` / `pnpm start*` 실행 시 1회 자동 마이그레이션 적용
 - AGENTS 오케스트레이션에 `INBOX_SECRET_DISCOVERY_V2`를 추가해 쉘 env, `.env`, `.env.clone`, 공통 프로젝트 루트에서 시크릿 자동 탐색 지원
-- 에이전트 1:1 채팅에서 장문 응답이 중간에 과도하게 잘리는 문제를 보완
+- 에이전트 1:1 채팅에서 장문 응답 잘림을 보완하고, 동일 문구 반복 출력 사이클을 축소
 - 상세 문서: [`docs/releases/v1.0.5.md`](docs/releases/v1.0.5.md)
 
 ---

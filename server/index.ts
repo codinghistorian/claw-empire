@@ -6084,6 +6084,12 @@ Whenever you complete a subtask, report it in this format:
   const subModelHint = subModel && (provider === "claude" || provider === "codex")
     ? `\n[Sub-agent model preference] When spawning sub-agents (Task tool), prefer using model: ${subModel}${subReasoningLevel ? ` with reasoning effort: ${subReasoningLevel}` : ""}`
     : "";
+  const runInstruction = pickL(l(
+    ["위 작업을 충분히 완수하세요. 필요하다면 위 대화 맥락을 참고하세요."],
+    ["Please complete the task above thoroughly. Use the conversation context above if relevant."],
+    ["上記タスクを丁寧に完了してください。必要に応じて上の会話コンテキストを参照してください。"],
+    ["请完整地完成上述任务。如有需要，请参考上方对话上下文。"],
+  ), taskLang);
 
   const prompt = [
     `[Task] ${task.title}`,
@@ -6096,7 +6102,8 @@ Whenever you complete a subtask, report it in this format:
     worktreePath ? `NOTE: You are working in an isolated Git worktree branch (climpire/${id.slice(0, 8)}). Commit your changes normally.` : "",
     subtaskInstruction,
     subModelHint,
-    `Please complete the task above thoroughly. Use the conversation context above if relevant.`,
+    localeInstruction(taskLang),
+    runInstruction,
   ].filter(Boolean).join("\n");
 
   appendTaskLog(id, "system", `RUN start (agent=${agent.name}, provider=${provider})`);

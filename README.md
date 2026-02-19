@@ -66,7 +66,7 @@ Claw-Empire transforms your CLI-based AI coding assistants — **Claude Code**, 
 
 ---
 
-## Install with AI
+## Install with an AI Agent
 
 > **Just paste this to your AI coding agent (Claude Code, Codex, Gemini CLI, etc.):**
 >

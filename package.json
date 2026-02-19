@@ -20,7 +20,12 @@
     "setup": "node scripts/setup.mjs",
     "arch:map": "node scripts/generate-architecture-report.mjs",
     "preflight:public": "bash scripts/preflight-public.sh",
-    "audit:verify": "node scripts/verify-security-audit-log.mjs"
+    "audit:verify": "node scripts/verify-security-audit-log.mjs",
+    "test:web": "vitest --config vitest.config.ts",
+    "test:api": "vitest --config server/vitest.config.ts",
+    "test:e2e": "playwright test --config playwright.config.ts",
+    "test": "pnpm run test:web && pnpm run test:api",
+    "test:ci": "pnpm run test:web -- --coverage && pnpm run test:api -- --coverage && pnpm run test:e2e"
   },
   "dependencies": {
     "@rollup/rollup-darwin-arm64": "^4.57.1",
@@ -51,9 +56,19 @@
     "nodemon": "^3.1.11",
     "postcss": "^8.5.4",
     "tailwindcss": "^4.1.8",
+    "@playwright/test": "^1.54.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.0.1",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/supertest": "^6.0.3",
+    "@vitest/coverage-v8": "^3.0.3",
+    "msw": "^2.8.2",
+    "supertest": "^7.0.0",
+    "jsdom": "^26.1.0",
     "tsx": "^4.21.0",
     "typescript": "~5.9.3",
-    "vite": "^7.2.4"
+    "vite": "^7.2.4",
+    "vitest": "^3.0.3"
   },
   "engines": {
     "node": ">=22"

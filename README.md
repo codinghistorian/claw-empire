@@ -60,6 +60,8 @@ Claw-Empire transforms your CLI-based AI coding assistants — **Claude Code**, 
 - AI install guide and Quick Start now explicitly validate `INBOX_WEBHOOK_SECRET` and `OPENCLAW_CONFIG`
 - `OPENCLAW_CONFIG` handling is hardened: runtime now normalizes surrounding quotes and leading `~`
 - OpenClaw setup docs now recommend absolute `.env` paths (unquoted preferred) to avoid path-parsing ambiguity
+- Existing clones that pull `v1.0.5` now run a one-time auto-migration on first `pnpm dev*` / `pnpm start*`
+- AGENTS orchestration now includes `INBOX_SECRET_DISCOVERY_V2` to resolve inbox secrets from shell env, `.env`, `.env.clone`, and common project roots
 - Full notes: [`docs/releases/v1.0.5.md`](docs/releases/v1.0.5.md)
 
 ---
@@ -218,6 +220,7 @@ macOS/Linux:
 
 # AGENTS orchestration rules installed
 grep -R "BEGIN claw-empire orchestration rules" ~/.openclaw/workspace/AGENTS.md AGENTS.md 2>/dev/null || true
+grep -R "INBOX_SECRET_DISCOVERY_V2" ~/.openclaw/workspace/AGENTS.md AGENTS.md 2>/dev/null || true
 
 # OpenClaw inbox requirements in .env
 grep -E '^(INBOX_WEBHOOK_SECRET|OPENCLAW_CONFIG)=' .env || true
@@ -229,6 +232,7 @@ Windows PowerShell:
 if ((Test-Path .\.env) -and (Test-Path .\scripts\setup.mjs)) { "setup files ok" }
 $agentCandidates = @("$env:USERPROFILE\.openclaw\workspace\AGENTS.md", ".\AGENTS.md")
 $agentCandidates | ForEach-Object { if (Test-Path $_) { Select-String -Path $_ -Pattern "BEGIN claw-empire orchestration rules" } }
+$agentCandidates | ForEach-Object { if (Test-Path $_) { Select-String -Path $_ -Pattern "INBOX_SECRET_DISCOVERY_V2" } }
 
 # OpenClaw inbox requirements in .env
 Get-Content .\.env | Select-String -Pattern '^(INBOX_WEBHOOK_SECRET|OPENCLAW_CONFIG)='
@@ -265,7 +269,10 @@ curl -X POST http://127.0.0.1:8790/api/inbox \
   -d '{"source":"telegram","author":"ceo","text":"$README v1.0.5 inbox smoke test","skipPlannedMeeting":true}'
 ```
 
-Expected: non-`401` response when `INBOX_WEBHOOK_SECRET` and `x-inbox-secret` match.
+Expected:
+- `200` when `INBOX_WEBHOOK_SECRET` is configured and `x-inbox-secret` matches.
+- `401` when the header is missing/mismatched.
+- `503` when `INBOX_WEBHOOK_SECRET` is not configured on the server.
 
 ---
 
@@ -300,7 +307,13 @@ Set both values in `.env` before sending chat webhooks:
 - `INBOX_WEBHOOK_SECRET=<long-random-secret>`
 - `OPENCLAW_CONFIG=<absolute-path-to-openclaw.json>` (unquoted preferred)
 
-`/api/inbox` requires the `x-inbox-secret` header to exactly match `INBOX_WEBHOOK_SECRET`; otherwise the request is rejected with `401`.
+`scripts/openclaw-setup.sh` / `scripts/openclaw-setup.ps1` now auto-generate `INBOX_WEBHOOK_SECRET` when it is missing.
+Initial install via `bash install.sh` / `install.ps1` already goes through these setup scripts, so this is applied from day one.
+For existing clones that only run `git pull`, `pnpm dev*` / `pnpm start*` now auto-apply this once when needed and then persist `CLAW_MIGRATION_V1_0_5_DONE=1` to prevent repeated execution.
+
+`/api/inbox` requires server-side `INBOX_WEBHOOK_SECRET` plus an `x-inbox-secret` header that exactly matches it.
+- Missing/mismatched header -> `401`
+- Missing server config (`INBOX_WEBHOOK_SECRET`) -> `503`
 
 ### Manual Setup (Fallback)
 
@@ -438,7 +451,8 @@ When a chat message starts with `$`, Claw-Empire handles it as a CEO directive:
 4. If meeting is skipped, include `"skipPlannedMeeting": true`.
 5. Server stores it as `directive`, broadcasts company-wide, then delegates to Planning (and mentioned departments when included).
 
-If `x-inbox-secret` is missing or does not match `INBOX_WEBHOOK_SECRET`, the request is rejected with `401`.
+If `x-inbox-secret` is missing/mismatched, the request is rejected with `401`.
+If `INBOX_WEBHOOK_SECRET` is not configured on the server, the request is rejected with `503`.
 
 With meeting:
 

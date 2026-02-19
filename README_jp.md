@@ -60,6 +60,8 @@ Claw-EmpireはCLIベースのAIコーディングアシスタント — **Claude
 - AIインストールガイドとクイックスタートに `INBOX_WEBHOOK_SECRET` と `OPENCLAW_CONFIG` の検証手順を追加
 - `OPENCLAW_CONFIG` の取り扱いを強化: ランタイムで外側の引用符と先頭 `~` を正規化
 - OpenClaw設定ドキュメントに `.env` の絶対パス運用（引用符なし推奨）を明確化
+- 既存クローンが `v1.0.5` を `git pull` した場合も、初回 `pnpm dev*` / `pnpm start*` 実行時に1回だけ自動マイグレーションを適用
+- AGENTS オーケストレーションに `INBOX_SECRET_DISCOVERY_V2` を追加し、シェル環境変数・`.env`・`.env.clone`・代表的なプロジェクトルートからシークレット自動探索を実施
 - 詳細: [`docs/releases/v1.0.5.md`](docs/releases/v1.0.5.md)
 
 ---
@@ -218,6 +220,7 @@ macOS/Linux:
 
 # AGENTSオーケストレーションルール確認
 grep -R "BEGIN claw-empire orchestration rules" ~/.openclaw/workspace/AGENTS.md AGENTS.md 2>/dev/null || true
+grep -R "INBOX_SECRET_DISCOVERY_V2" ~/.openclaw/workspace/AGENTS.md AGENTS.md 2>/dev/null || true
 
 # OpenClaw inbox 必須 .env 項目確認
 grep -E '^(INBOX_WEBHOOK_SECRET|OPENCLAW_CONFIG)=' .env || true
@@ -229,6 +232,7 @@ Windows PowerShell:
 if ((Test-Path .\.env) -and (Test-Path .\scripts\setup.mjs)) { "setup files ok" }
 $agentCandidates = @("$env:USERPROFILE\.openclaw\workspace\AGENTS.md", ".\AGENTS.md")
 $agentCandidates | ForEach-Object { if (Test-Path $_) { Select-String -Path $_ -Pattern "BEGIN claw-empire orchestration rules" } }
+$agentCandidates | ForEach-Object { if (Test-Path $_) { Select-String -Path $_ -Pattern "INBOX_SECRET_DISCOVERY_V2" } }
 
 # OpenClaw inbox 必須 .env 項目確認
 Get-Content .\.env | Select-String -Pattern '^(INBOX_WEBHOOK_SECRET|OPENCLAW_CONFIG)='
@@ -265,7 +269,10 @@ curl -X POST http://127.0.0.1:8790/api/inbox \
   -d '{"source":"telegram","author":"ceo","text":"$README v1.0.5 inbox 検証","skipPlannedMeeting":true}'
 ```
 
-期待値: `INBOX_WEBHOOK_SECRET` と `x-inbox-secret` が一致すれば `401` 以外の応答
+期待値:
+- サーバーに `INBOX_WEBHOOK_SECRET` が設定され、`x-inbox-secret` が一致する場合は `200`
+- ヘッダー欠落/不一致の場合は `401`
+- サーバー側 `INBOX_WEBHOOK_SECRET` 未設定の場合は `503`
 
 ---
 
@@ -300,7 +307,13 @@ curl -X POST http://127.0.0.1:8790/api/inbox \
 - `INBOX_WEBHOOK_SECRET=<十分に長いランダムシークレット>`
 - `OPENCLAW_CONFIG=<openclaw.json の絶対パス>`（引用符なし推奨）
 
-`/api/inbox` は `x-inbox-secret` ヘッダーが `INBOX_WEBHOOK_SECRET` と完全一致しない場合、`401` を返します。
+`scripts/openclaw-setup.sh` / `scripts/openclaw-setup.ps1` は `INBOX_WEBHOOK_SECRET` が未設定なら自動生成します。
+初期インストール（`bash install.sh` / `install.ps1`）でも同じセットアップスクリプトを通るため、初回から自動適用されます。
+既存クローンで `git pull` のみ実施した場合も、`pnpm dev*` / `pnpm start*` 初回実行時に必要条件で1回自動補正し、以後の再実行防止として `CLAW_MIGRATION_V1_0_5_DONE=1` を保存します。
+
+`/api/inbox` はサーバー側 `INBOX_WEBHOOK_SECRET` と `x-inbox-secret` ヘッダーの完全一致が必要です。
+- ヘッダー欠落/不一致 -> `401`
+- サーバー設定欠落（`INBOX_WEBHOOK_SECRET`） -> `503`
 
 ### 手動セットアップ（代替）
 
@@ -432,6 +445,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 5. サーバーは `directive` として保存し、全社共有後に企画チーム（およびメンション部門）へ委任します。
 
 `x-inbox-secret` が欠落、または `INBOX_WEBHOOK_SECRET` と不一致の場合、サーバーは `401` を返します。
+サーバー側で `INBOX_WEBHOOK_SECRET` が未設定の場合は `503` を返します。
 
 会議あり:
 

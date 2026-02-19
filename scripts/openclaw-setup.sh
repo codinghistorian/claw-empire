@@ -161,6 +161,13 @@ if (!currentSecret || currentSecret === "__CHANGE_ME__") {
   console.log("[Claw-Empire] Generated OAUTH_ENCRYPTION_SECRET");
 }
 
+const currentInboxSecret = read("INBOX_WEBHOOK_SECRET");
+if (!currentInboxSecret || currentInboxSecret === "__CHANGE_ME__") {
+  const generatedInbox = crypto.randomBytes(32).toString("hex");
+  upsert("INBOX_WEBHOOK_SECRET", `"${generatedInbox}"`);
+  console.log("[Claw-Empire] Generated INBOX_WEBHOOK_SECRET");
+}
+
 const port = process.env.CLAW_SETUP_PORT?.trim();
 if (port) {
   upsert("PORT", port);

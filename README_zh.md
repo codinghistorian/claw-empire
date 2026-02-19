@@ -60,6 +60,8 @@ Claw-Empire 将您的 CLI AI 编程助手 —— **Claude Code**、**Codex CLI**
 - AI 安装指南与快速开始新增 `INBOX_WEBHOOK_SECRET`、`OPENCLAW_CONFIG` 校验步骤
 - 强化 `OPENCLAW_CONFIG` 处理：运行时会规范化外层引号与前导 `~`
 - OpenClaw 配置文档明确建议 `.env` 使用绝对路径（推荐不加引号）
+- 现有克隆仓库在 `git pull v1.0.5` 后，首次执行 `pnpm dev*` / `pnpm start*` 时也会自动执行一次迁移修复
+- AGENTS 编排规则新增 `INBOX_SECRET_DISCOVERY_V2`，可从 shell 环境变量、`.env`、`.env.clone` 及常见项目根目录自动发现密钥
 - 详细说明：[`docs/releases/v1.0.5.md`](docs/releases/v1.0.5.md)
 
 ---
@@ -218,6 +220,7 @@ macOS/Linux:
 
 # 检查 AGENTS 编排规则
 grep -R "BEGIN claw-empire orchestration rules" ~/.openclaw/workspace/AGENTS.md AGENTS.md 2>/dev/null || true
+grep -R "INBOX_SECRET_DISCOVERY_V2" ~/.openclaw/workspace/AGENTS.md AGENTS.md 2>/dev/null || true
 
 # 检查 OpenClaw inbox 必要 .env 项
 grep -E '^(INBOX_WEBHOOK_SECRET|OPENCLAW_CONFIG)=' .env || true
@@ -229,6 +232,7 @@ Windows PowerShell:
 if ((Test-Path .\.env) -and (Test-Path .\scripts\setup.mjs)) { "setup files ok" }
 $agentCandidates = @("$env:USERPROFILE\.openclaw\workspace\AGENTS.md", ".\AGENTS.md")
 $agentCandidates | ForEach-Object { if (Test-Path $_) { Select-String -Path $_ -Pattern "BEGIN claw-empire orchestration rules" } }
+$agentCandidates | ForEach-Object { if (Test-Path $_) { Select-String -Path $_ -Pattern "INBOX_SECRET_DISCOVERY_V2" } }
 
 # 检查 OpenClaw inbox 必要 .env 项
 Get-Content .\.env | Select-String -Pattern '^(INBOX_WEBHOOK_SECRET|OPENCLAW_CONFIG)='
@@ -265,7 +269,10 @@ curl -X POST http://127.0.0.1:8790/api/inbox \
   -d '{"source":"telegram","author":"ceo","text":"$README v1.0.5 inbox 校验","skipPlannedMeeting":true}'
 ```
 
-期望结果：当 `INBOX_WEBHOOK_SECRET` 与 `x-inbox-secret` 一致时，响应应为非 `401`。
+期望结果：
+- 服务器已配置 `INBOX_WEBHOOK_SECRET` 且 `x-inbox-secret` 匹配时返回 `200`
+- 头缺失或不匹配时返回 `401`
+- 服务器未配置 `INBOX_WEBHOOK_SECRET` 时返回 `503`
 
 ---
 
@@ -300,7 +307,13 @@ curl -X POST http://127.0.0.1:8790/api/inbox \
 - `INBOX_WEBHOOK_SECRET=<足够长的随机密钥>`
 - `OPENCLAW_CONFIG=<openclaw.json 绝对路径>`（推荐不加引号）
 
-`/api/inbox` 要求 `x-inbox-secret` 头与 `INBOX_WEBHOOK_SECRET` 完全一致，否则会返回 `401`。
+`scripts/openclaw-setup.sh` / `scripts/openclaw-setup.ps1` 在 `INBOX_WEBHOOK_SECRET` 缺失时会自动生成。
+首次安装（`bash install.sh` / `install.ps1`）同样会执行这些 setup 脚本，因此从第一天开始就自动生效。
+对于已克隆仓库仅执行 `git pull` 的场景，`pnpm dev*` / `pnpm start*` 首次运行也会按需自动修复一次，并写入 `CLAW_MIGRATION_V1_0_5_DONE=1` 防止重复执行。
+
+`/api/inbox` 要求服务端 `INBOX_WEBHOOK_SECRET` 与 `x-inbox-secret` 头完全一致。
+- 头缺失/不匹配 -> `401`
+- 服务端配置缺失（`INBOX_WEBHOOK_SECRET`） -> `503`
 
 ### 手动安装（备用）
 
@@ -432,6 +445,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 5. 服务器按 `directive` 存储并全员广播，然后委派给企划组（以及被提及的部门）。
 
 若 `x-inbox-secret` 缺失，或与 `INBOX_WEBHOOK_SECRET` 不一致，服务器将返回 `401`。
+若服务端未配置 `INBOX_WEBHOOK_SECRET`，服务器将返回 `503`。
 
 召开会议：
 

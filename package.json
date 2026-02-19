@@ -4,6 +4,12 @@
   "description": "Claw-Empire - AI Agent Company Simulation. Command your CLI agent empire from the CEO desk.",
   "type": "module",
   "scripts": {
+    "migrate:v1.0.5": "node scripts/auto-apply-v1.0.5.mjs",
+    "predev": "node scripts/auto-apply-v1.0.5.mjs",
+    "predev:local": "node scripts/auto-apply-v1.0.5.mjs",
+    "predev:tailscale": "node scripts/auto-apply-v1.0.5.mjs",
+    "prestart": "node scripts/auto-apply-v1.0.5.mjs",
+    "prestart:tailscale": "node scripts/auto-apply-v1.0.5.mjs",
     "dev": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 0.0.0.0 --port 8800\" \"cross-env VITE_DEV=1 HOST=0.0.0.0 nodemon --watch server --ext ts --exec tsx server/index.ts\"",
     "dev:local": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 127.0.0.1 --port 8800\" \"cross-env VITE_DEV=1 HOST=127.0.0.1 nodemon --watch server --ext ts --exec tsx server/index.ts\"",
     "dev:tailscale": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 0.0.0.0 --port 8800\" \"cross-env VITE_DEV=1 HOST=0.0.0.0 nodemon --watch server --ext ts --exec tsx server/index.ts\"",

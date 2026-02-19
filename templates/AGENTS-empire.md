@@ -58,11 +58,74 @@ Based on the user's answers:
 - Use `skipPlannedMeeting` from the meeting choice.
 - If the user gave an exact path, include `"project_path":"<path>"`.
 - If the user gave fuzzy context (e.g., "existing climpire project", "new project"), include `"project_context":"<text>"`.
+- Resolve `INBOX_WEBHOOK_SECRET` and ALWAYS send it as `x-inbox-secret`.
+- If `INBOX_WEBHOOK_SECRET` is missing, do NOT claim success; ask the user to set it first.
+
+Resolve and validate the secret first (do not assume shell export):
+```bash
+# INBOX_SECRET_DISCOVERY_V2
+INBOX_SECRET_VALUE="${INBOX_WEBHOOK_SECRET:-$(node <<'NODE'
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { execSync } = require("node:child_process");
+
+function readSecret(file) {
+  if (!file || !fs.existsSync(file)) return "";
+  const match = fs.readFileSync(file, "utf8").match(/^INBOX_WEBHOOK_SECRET\\s*=\\s*(.*)$/m);
+  if (!match) return "";
+  const value = match[1].trim().replace(/^['\\\"]|['\\\"]$/g, "");
+  return value && value !== "__CHANGE_ME__" ? value : "";
+}
+
+const candidates = [
+  path.join(process.cwd(), ".env"),
+  path.join(process.cwd(), ".env.clone"),
+];
+
+try {
+  const gitRoot = execSync("git rev-parse --show-toplevel", {
+    stdio: ["ignore", "pipe", "ignore"],
+    encoding: "utf8",
+  }).trim();
+  if (gitRoot) {
+    candidates.push(path.join(gitRoot, ".env"));
+    candidates.push(path.join(gitRoot, ".env.clone"));
+  }
+} catch {
+  // ignore
+}
+
+const home = os.homedir();
+for (const rel of [
+  "Projects/climpire/.env",
+  "projects/climpire/.env",
+  "Projects/claw-empire/.env",
+  "projects/claw-empire/.env",
+  "Projects/claw-empire-clone/.env",
+  "projects/claw-empire-clone/.env",
+  "Projects/claw-empire-clone/.env.clone",
+  "projects/claw-empire-clone/.env.clone",
+]) {
+  candidates.push(path.join(home, rel));
+}
+
+for (const file of [...new Set(candidates)]) {
+  const secret = readSecret(file);
+  if (!secret) continue;
+  process.stdout.write(secret);
+  process.exit(0);
+}
+NODE
+)}"
+[ -n "$INBOX_SECRET_VALUE" ] || { echo "INBOX_WEBHOOK_SECRET is missing (.env or shell env)." >&2; exit 1; }
+```
 
 **Option 1 — With meeting (default):**
 ```bash
 curl -X POST http://127.0.0.1:__PORT__/api/inbox \
   -H 'content-type: application/json' \
+  -H "x-inbox-secret: $INBOX_SECRET_VALUE" \
   -d '{"source":"telegram","text":"$<message content>","author":"<sender>","project_path":"<optional path>","project_context":"<optional context>"}'
 ```
 
@@ -70,20 +133,22 @@ curl -X POST http://127.0.0.1:__PORT__/api/inbox \
 ```bash
 curl -X POST http://127.0.0.1:__PORT__/api/inbox \
   -H 'content-type: application/json' \
+  -H "x-inbox-secret: $INBOX_SECRET_VALUE" \
   -d '{"source":"telegram","text":"$<message content>","author":"<sender>","skipPlannedMeeting":true,"project_path":"<optional path>","project_context":"<optional context>"}'
 ```
 
 **Do NOT modify the directive text.** Use `"skipPlannedMeeting": true` in the JSON body to skip the meeting. The directive message is passed to agents as-is.
+Only treat as success when API status is `200` (and response body indicates success).
 
 ### Step 5: Confirm
 
-Reply with **only a short confirmation** in the user's language:
+If API status is `200`, reply with **only a short confirmation** in the user's language:
 - KO: `✅ Claw-Empire 업무지시 전달 완료` (회의 진행) / `✅ Claw-Empire 업무지시 전달 완료 (회의 생략)` (회의 없이)
 - EN: `✅ Directive sent` (with meeting) / `✅ Directive sent (no meeting)` (without meeting)
 - JA: `✅ 指令を送信しました` (会議あり) / `✅ 指令を送信しました（会議なし）` (会議なし)
 - ZH: `✅ 指令已发送` (召开会议) / `✅ 指令已发送（免会议）` (不开会)
 
-**NEVER attach additional information** — no OAuth status, no settings, no agent lists, no server response JSON, no provider details. Confirmation message only.
+If API status is non-`200`, do NOT send success text. Return only a short failure notice (status code + concise reason).
 
 ### What happens on the server
 
@@ -122,8 +187,10 @@ When receiving a message that **starts with `#`**:
    ```bash
    curl -X POST http://127.0.0.1:__PORT__/api/inbox \
      -H 'content-type: application/json' \
+     -H "x-inbox-secret: $INBOX_SECRET_VALUE" \
      -d '{"source":"telegram","text":"<message content>"}'
    ```
+   - Validate HTTP status first. If non-`200`, report failure and stop.
 3. Confirm to the user (in their language):
    - KO: "태스크 등록 완료"
    - EN: "Task registered"
@@ -200,6 +267,7 @@ When creating tasks via webhook, include `project_path` if known:
 ```bash
 curl -X POST http://127.0.0.1:__PORT__/api/inbox \
   -H 'content-type: application/json' \
+  -H "x-inbox-secret: $INBOX_SECRET_VALUE" \
   -d '{"source":"telegram","text":"fix the build","project_path":"/Users/me/my-project"}'
 ```
 
@@ -236,11 +304,13 @@ curl "http://127.0.0.1:__PORT__/api/tasks?status=inbox"
 # Create task via inbox webhook
 curl -X POST http://127.0.0.1:__PORT__/api/inbox \
   -H 'content-type: application/json' \
+  -H "x-inbox-secret: $INBOX_SECRET_VALUE" \
   -d '{"source":"telegram","text":"<message>"}'
 
 # Send CEO directive ($ prefix included)
 curl -X POST http://127.0.0.1:__PORT__/api/inbox \
   -H 'content-type: application/json' \
+  -H "x-inbox-secret: $INBOX_SECRET_VALUE" \
   -d '{"source":"telegram","text":"$<directive message>"}'
 
 # View task detail
@@ -286,7 +356,8 @@ When processing `$` or `#` commands, the response to the user must be **minimal 
 
 1. **`$` directive**: After collecting required meeting/path inputs and sending to API, reply with only `✅ Claw-Empire 업무지시 전달 완료` (or language equivalent). Nothing else.
 2. **`#` task**: Only `✅ 태스크 등록 완료` (or language equivalent). Nothing else.
-3. **NEVER include** in responses:
+3. **Failure case**: If API status is non-`200`, do not send success text. Return only a short failure notice (status + reason).
+4. **NEVER include** in responses:
    - OAuth connection details or token information
    - Server settings or configuration
    - Agent lists or provider status

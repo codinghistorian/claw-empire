@@ -65,6 +65,7 @@ export function initializeWorkflowMeetingTools(ctx: any): any {
   const httpAgentCounter = __ctx.httpAgentCounter;
   const interruptPidTree = __ctx.interruptPidTree;
   const isPidAlive = __ctx.isPidAlive;
+  const isTaskWorkflowInterrupted = __ctx.isTaskWorkflowInterrupted;
   const killPidTree = __ctx.killPidTree;
   const launchHttpAgent = __ctx.launchHttpAgent;
   const mergeWorktree = __ctx.mergeWorktree;
@@ -73,6 +74,7 @@ export function initializeWorkflowMeetingTools(ctx: any): any {
   const refreshGoogleToken = __ctx.refreshGoogleToken;
   const rollbackTaskWorktree = __ctx.rollbackTaskWorktree;
   const runAgentOneShot = __ctx.runAgentOneShot;
+  const clearTaskWorkflowState = __ctx.clearTaskWorkflowState;
   const seedApprovedPlanSubtasks = __ctx.seedApprovedPlanSubtasks;
   const spawnCliAgent = __ctx.spawnCliAgent;
   const stopRequestModeByTask = __ctx.stopRequestModeByTask;

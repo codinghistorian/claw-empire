@@ -1685,11 +1685,18 @@ function chooseSafeReply(
   return cleaned;
 }
 
-function summarizeForMeetingBubble(text: string, maxChars = 96): string {
+const MEETING_BUBBLE_EMPTY: L10n = l(
+  ["의견 공유드립니다."],
+  ["Sharing thoughts shortly."],
+  ["ご意見を共有します。"],
+  ["稍后分享意见。"],
+);
+
+function summarizeForMeetingBubble(text: string, maxChars = 96, lang: Lang = getPreferredLanguage()): string {
   const cleaned = normalizeConversationReply(text, maxChars + 24)
     .replace(/\s+/g, " ")
     .trim();
-  if (!cleaned) return "의견 공유드립니다.";
+  if (!cleaned) return pickL(MEETING_BUBBLE_EMPTY, lang);
   if (cleaned.length <= maxChars) return cleaned;
   return `${cleaned.slice(0, maxChars - 1).trimEnd()}…`;
 }
@@ -4180,8 +4187,9 @@ function emitMeetingSpeech(
   phase: "kickoff" | "review",
   taskId: string,
   line: string,
+  lang?: Lang,
 ): void {
-  const preview = summarizeForMeetingBubble(line);
+  const preview = summarizeForMeetingBubble(line, 96, lang);
   const decision = phase === "review" ? classifyMeetingReviewDecision(preview) : undefined;
   if (decision) {
     meetingReviewDecisionByAgent.set(agentId, decision);
@@ -4279,7 +4287,7 @@ function startReviewConsensusMeeting(
         if (isTaskWorkflowInterrupted(taskId)) return;
         sendAgentMessage(leader, content, messageType, receiverType, receiverId, taskId);
         const seatIndex = seatIndexByAgent.get(leader.id) ?? 0;
-        emitMeetingSpeech(leader.id, seatIndex, "review", taskId, content);
+        emitMeetingSpeech(leader.id, seatIndex, "review", taskId, content, lang);
         pushTranscript(leader, content);
         if (meetingId) {
           appendMeetingMinuteEntry(meetingId, minuteSeq++, leader, lang, messageType, content);
@@ -4669,7 +4677,7 @@ function startPlannedApprovalMeeting(
         if (isTaskWorkflowInterrupted(taskId)) return;
         sendAgentMessage(leader, content, messageType, receiverType, receiverId, taskId);
         const seatIndex = seatIndexByAgent.get(leader.id) ?? 0;
-        emitMeetingSpeech(leader.id, seatIndex, "kickoff", taskId, content);
+        emitMeetingSpeech(leader.id, seatIndex, "kickoff", taskId, content, lang);
         pushTranscript(leader, content);
         if (meetingId) {
           appendMeetingMinuteEntry(meetingId, minuteSeq++, leader, lang, messageType, content);

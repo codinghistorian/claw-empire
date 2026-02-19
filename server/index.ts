@@ -7167,6 +7167,12 @@ app.post("/api/tasks/:id/run", (req, res) => {
   const subModelHint = subModel && (provider === "claude" || provider === "codex")
     ? `\n[Sub-agent model preference] When spawning sub-agents (Task tool), prefer using model: ${subModel}${subReasoningLevel ? ` with reasoning effort: ${subReasoningLevel}` : ""}`
     : "";
+  const runInstruction = pickL(l(
+    ["위 작업을 충분히 완수하세요. 위 대화 맥락과 프로젝트 구조를 참고해도 좋지만, 프로젝트 구조 탐색에 시간을 쓰지 마세요. 필요한 구조는 이미 제공되었습니다."],
+    ["Please complete the task above thoroughly. Use the conversation context and project structure above if relevant. Do NOT spend time exploring the project structure, it is already provided above."],
+    ["上記タスクを丁寧に完了してください。必要に応じて上の会話コンテキストとプロジェクト構成を参照できますが、構成探索には時間を使わないでください。必要な構成はすでに提示されています。"],
+    ["请完整地完成上述任务。可按需参考上方对话上下文和项目结构，但不要花时间自行探索项目结构，所需结构已在上方提供。"],
+  ), taskLang);
 
   const prompt = buildTaskExecutionPrompt([
     projectContext ? `[Project Structure]\n${projectContext.length > 4000 ? projectContext.slice(0, 4000) + "\n... (truncated)" : projectContext}` : "",
@@ -7181,7 +7187,8 @@ app.post("/api/tasks/:id/run", (req, res) => {
     worktreePath ? `NOTE: You are working in an isolated Git worktree branch (climpire/${id.slice(0, 8)}). Commit your changes normally.` : "",
     subtaskInstruction,
     subModelHint,
-    `Please complete the task above thoroughly. Use the conversation context and project structure above if relevant. Do NOT spend time exploring the project structure — it is already provided above.`,
+    localeInstruction(taskLang),
+    runInstruction,
   ], {
     allowWarningFix: hasExplicitWarningFixRequest(task.title, task.description),
   });
